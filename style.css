@@ -1,0 +1,15 @@
+/* Token Usage Tracker Extension Styles */
+
+/* Active state for range buttons */
+.range-btn.active {
+  background-color: white;
+  color: #0f172a; /* slate-900 */
+  box-shadow: 
+    0 0 0 1px rgba(0, 0, 0, 0.05),
+    0 1px 2px 0 rgba(0, 0, 0, 0.05);
+}
+
+/* Transition for the hover cursor rect in the graph */
+.cursor-rect {
+  transition: fill 0.1s;
+}

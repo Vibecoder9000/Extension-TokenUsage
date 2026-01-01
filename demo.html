@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Token Usage Tracker</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body class="bg-slate-50 text-slate-900 antialiased font-sans">
+    <div class="min-h-screen p-4 sm:p-8 flex flex-col items-center justify-start">
+      <div class="w-full max-w-5xl space-y-4">
+        
+        <!-- Controls -->
+        <div class="flex justify-end">
+           <div class="bg-slate-100 p-1 rounded-lg inline-flex" id="range-selector">
+              <button data-value="7" class="range-btn px-4 py-1.5 text-sm font-medium rounded-md transition-all duration-200 ease-in-out text-slate-500 hover:text-slate-700 hover:bg-slate-200/50">7D</button>
+              <button data-value="30" class="range-btn px-4 py-1.5 text-sm font-medium rounded-md transition-all duration-200 ease-in-out active">30D</button>
+              <button data-value="90" class="range-btn px-4 py-1.5 text-sm font-medium rounded-md transition-all duration-200 ease-in-out text-slate-500 hover:text-slate-700 hover:bg-slate-200/50">90D</button>
+           </div>
+        </div>
+
+        <!-- Main Chart Card -->
+        <main class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6 sm:p-8">
+          <div id="chart-container" class="h-[400px] w-full relative select-none">
+            <!-- SVG injected by JS -->
+          </div>
+        </main>
+
+      </div>
+    </div>
+
+    <!-- Tooltip -->
+    <div id="tooltip" class="fixed hidden bg-slate-900/95 text-white px-3 py-2 rounded-lg shadow-xl text-xs ring-1 ring-white/10 pointer-events-none z-50 whitespace-nowrap top-0 left-0">
+      <p id="tooltip-date" class="font-semibold text-slate-200 mb-0.5"></p>
+      <p id="tooltip-usage" class="font-medium text-indigo-300"></p>
+    </div>
+
+    <script src="ui.js"></script>
+  </body>
+</html>
