@@ -548,7 +548,7 @@ async function handleGenerationStarted(type, params, isDryRun) {
 async function handleMessageReceived(messageIndex, type) {
     // Filter out events that don't correspond to actual API calls
     // These events are emitted for messages created without calling the API
-    const nonApiTypes = ['command', 'first_message', 'extension'];
+    const nonApiTypes = ['command', 'first_message'];
     if (nonApiTypes.includes(type)) {
         console.log(`[Token Usage Tracker] Skipping non-API message type: ${type}`);
         return;
@@ -1562,12 +1562,146 @@ function createSettingsUI() {
     });
 }
 
+/**
+ * Patch SillyTavern's background generation functions to track tokens
+ * - generateQuiet / generate_quiet (Used by Summarize, generated prompts, etc.)
+ * - ConnectionManagerRequestService.sendRequest (Used by extensions like Roadway)
+ */
+let isTrackingBackground = false;
+
+function patchBackgroundGenerations() {
+    patchGenerateQuiet();
+    patchConnectionManager();
+}
+
+function patchGenerateQuiet() {
+    if (window.generateQuiet?._isPatched) return;
+
+    // Handle snake_case variant
+    if (typeof window.generateQuiet !== 'function' && typeof window.generate_quiet === 'function') {
+        console.log('[Token Usage Tracker] patching generate_quiet');
+        const original = window.generate_quiet;
+        window.generate_quiet = async function(prompt, ...args) {
+            return await handleBackgroundGeneration(original, this, [prompt, ...args], async () => {
+                // Input calculation for generateQuiet (usually string)
+                if (typeof prompt === 'string') return await countTokens(prompt);
+                if (Array.isArray(prompt)) return await countInputTokens({ prompt });
+                return 0;
+            }, async (result) => {
+                // Output calculation
+                return typeof result === 'string' ? await countTokens(result) : 0;
+            });
+        };
+        window.generate_quiet._isPatched = true;
+        return;
+    }
+
+    if (typeof window.generateQuiet === 'function') {
+        console.log('[Token Usage Tracker] Patching generateQuiet');
+        const original = window.generateQuiet;
+        window.generateQuiet = async function(prompt, ...args) {
+            return await handleBackgroundGeneration(original, this, [prompt, ...args], async () => {
+                if (typeof prompt === 'string') return await countTokens(prompt);
+                if (Array.isArray(prompt)) return await countInputTokens({ prompt });
+                return 0;
+            }, async (result) => {
+                return typeof result === 'string' ? await countTokens(result) : 0;
+            });
+        };
+        window.generateQuiet._isPatched = true;
+    }
+}
+
+function patchConnectionManager() {
+    // Poll for the service as it might load after this extension
+    const checkInterval = setInterval(() => {
+        try {
+            const context = getContext();
+            const service = context?.ConnectionManagerRequestService;
+
+            if (service && typeof service.sendRequest === 'function' && !service.sendRequest._isPatched) {
+                console.log('[Token Usage Tracker] Patching ConnectionManagerRequestService.sendRequest');
+                const original = service.sendRequest;
+
+                service.sendRequest = async function(profileId, messages, ...args) {
+                    return await handleBackgroundGeneration(original, this, [profileId, messages, ...args], async () => {
+                        // Input calculation (messages array)
+                        // Wrapping in object to match countInputTokens signature expectation
+                        return await countInputTokens({ prompt: messages });
+                    }, async (result) => {
+                        // Output calculation (ExtractedData .content)
+                        if (result && typeof result.content === 'string') {
+                            return await countTokens(result.content);
+                        }
+                        return 0;
+                    });
+                };
+
+                service.sendRequest._isPatched = true;
+                clearInterval(checkInterval);
+            }
+        } catch (e) {
+            // Ignore errors during polling
+        }
+    }, 1000);
+
+    // Stop polling after 30 seconds
+    setTimeout(() => clearInterval(checkInterval), 30000);
+}
+
+/**
+ * Generic handler for background generations with recursion guard
+ */
+async function handleBackgroundGeneration(originalFn, context, args, inputCounter, outputCounter) {
+    // Avoid double counting if one patched function calls another
+    if (isTrackingBackground) {
+        return await originalFn.apply(context, args);
+    }
+
+    let result;
+    let inputTokens = 0;
+    const modelId = getCurrentModelId();
+
+    try {
+        isTrackingBackground = true;
+
+        // Count input tokens
+        try {
+            inputTokens = await inputCounter();
+            console.log(`[Token Usage Tracker] Counting background input. Tokens: ${inputTokens}`);
+        } catch (e) {
+            console.error('[Token Usage Tracker] Error counting background input:', e);
+        }
+
+        // Execute original
+        result = await originalFn.apply(context, args);
+
+        // Count output tokens
+        try {
+            const outputTokens = await outputCounter(result);
+            if (outputTokens > 0 || inputTokens > 0) {
+                recordUsage(inputTokens, outputTokens, null, modelId);
+                console.log(`[Token Usage Tracker] Background usage recorded: ${inputTokens} in, ${outputTokens} out`);
+            }
+        } catch (e) {
+            console.error('[Token Usage Tracker] Error counting background output:', e);
+        }
+    } finally {
+        isTrackingBackground = false;
+    }
+
+    return result;
+}
+
 jQuery(async () => {
     console.log('[Token Usage Tracker] Initializing...');
 
     loadSettings();
     registerSlashCommands();
     createSettingsUI();
+
+    // Attempt to patch background generation functions
+    patchBackgroundGenerations();
 
     // Subscribe to events
     eventSource.on(event_types.GENERATION_STARTED, handleGenerationStarted);
