@@ -29,11 +29,6 @@ const defaultSettings = {
         allTime: { input: 0, output: 0, total: 0, messageCount: 0 },
         // Time-based buckets: { "2025-01-15": { input: X, output: Y, total: Z, models: { "gpt-4o": 500, ... } }, ... }
         byDay: {},
-        byHour: {},    // "2025-01-15T14": { ... }
-        byWeek: {},    // "2025-W03": { ... }
-        byMonth: {},   // "2025-01": { ... }
-        // Per-chat usage: { "chatId": { input: X, output: Y, ... }, ... }
-        byChat: {},
         // Per-model usage: { "gpt-4o": { input: X, output: Y, total: Z, messageCount: N }, ... }
         byModel: {},
     },
@@ -54,10 +49,6 @@ function loadSettings() {
     if (!settings.usage.session) settings.usage.session = structuredClone(defaultSettings.usage.session);
     if (!settings.usage.allTime) settings.usage.allTime = structuredClone(defaultSettings.usage.allTime);
     if (!settings.usage.byDay) settings.usage.byDay = {};
-    if (!settings.usage.byHour) settings.usage.byHour = {};
-    if (!settings.usage.byWeek) settings.usage.byWeek = {};
-    if (!settings.usage.byMonth) settings.usage.byMonth = {};
-    if (!settings.usage.byChat) settings.usage.byChat = {};
     if (!settings.usage.byModel) settings.usage.byModel = {};
 
     // Initialize modelPrices
@@ -231,27 +222,6 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, a
         }
     }
 
-    // By hour
-    const hourKey = getHourKey(now);
-    if (!usage.byHour[hourKey]) usage.byHour[hourKey] = { input: 0, output: 0, total: 0, messageCount: 0 };
-    addTokens(usage.byHour[hourKey]);
-
-    // By week
-    const weekKey = getWeekKey(now);
-    if (!usage.byWeek[weekKey]) usage.byWeek[weekKey] = { input: 0, output: 0, total: 0, messageCount: 0 };
-    addTokens(usage.byWeek[weekKey]);
-
-    // By month
-    const monthKey = getMonthKey(now);
-    if (!usage.byMonth[monthKey]) usage.byMonth[monthKey] = { input: 0, output: 0, total: 0, messageCount: 0 };
-    addTokens(usage.byMonth[monthKey]);
-
-    // By chat
-    if (chatId) {
-        if (!usage.byChat[chatId]) usage.byChat[chatId] = { input: 0, output: 0, total: 0, messageCount: 0 };
-        addTokens(usage.byChat[chatId]);
-    }
-
     // By model (aggregate)
     if (modelId) {
         if (!usage.byModel[modelId]) usage.byModel[modelId] = { input: 0, output: 0, total: 0, messageCount: 0 };
@@ -304,6 +274,10 @@ function getUsageStats() {
     const settings = getSettings();
     const usage = settings.usage;
     const now = new Date();
+    const currentWeekKey = getWeekKey(now);
+    const currentMonthKey = getMonthKey(now);
+    const thisWeek = { input: 0, output: 0, total: 0, messageCount: 0 };
+    const thisMonth = { input: 0, output: 0, total: 0, messageCount: 0 };
 
     // Get current tokenizer info for display
     let tokenizerInfo = { tokenizerName: 'Unknown' };
@@ -313,22 +287,41 @@ function getUsageStats() {
         // Ignore if not available yet
     }
 
+    for (const [dayKey, data] of Object.entries(usage.byDay)) {
+        const [year, month, day] = dayKey.split('-').map(Number);
+        const date = new Date(year, month - 1, day);
+
+        if (getWeekKey(date) === currentWeekKey) {
+            thisWeek.input += data.input || 0;
+            thisWeek.output += data.output || 0;
+            thisWeek.total += data.total || 0;
+            thisWeek.messageCount += data.messageCount || 0;
+        }
+
+        if (getMonthKey(date) === currentMonthKey) {
+            thisMonth.input += data.input || 0;
+            thisMonth.output += data.output || 0;
+            thisMonth.total += data.total || 0;
+            thisMonth.messageCount += data.messageCount || 0;
+        }
+    }
+
     return {
         session: { ...usage.session },
         allTime: { ...usage.allTime },
         today: usage.byDay[getDayKey(now)] || { input: 0, output: 0, total: 0, messageCount: 0, models: {} },
-        thisHour: usage.byHour[getHourKey(now)] || { input: 0, output: 0, total: 0, messageCount: 0 },
-        thisWeek: usage.byWeek[getWeekKey(now)] || { input: 0, output: 0, total: 0, messageCount: 0 },
-        thisMonth: usage.byMonth[getMonthKey(now)] || { input: 0, output: 0, total: 0, messageCount: 0 },
+        thisHour: usage.byHour?.[getHourKey(now)] || { input: 0, output: 0, total: 0, messageCount: 0 },
+        thisWeek,
+        thisMonth,
         currentChat: null, // Will be populated if context available
         // Metadata
         tokenizer: tokenizerInfo.tokenizerName,
         // Raw data for advanced aggregation
         byDay: { ...usage.byDay },
-        byHour: { ...usage.byHour },
-        byWeek: { ...usage.byWeek },
-        byMonth: { ...usage.byMonth },
-        byChat: { ...usage.byChat },
+        byHour: { ...(usage.byHour || {}) },
+        byWeek: { ...(usage.byWeek || {}) },
+        byMonth: { ...(usage.byMonth || {}) },
+        byChat: { ...(usage.byChat || {}) },
         byModel: { ...usage.byModel },
     };
 }
@@ -413,7 +406,7 @@ function parseApiUsage(apiUsage) {
  */
 function getChatUsage(chatId) {
     const settings = getSettings();
-    return settings.usage.byChat[chatId] || { input: 0, output: 0, total: 0, messageCount: 0 };
+    return settings.usage.byChat?.[chatId] || { input: 0, output: 0, total: 0, messageCount: 0 };
 }
 
 
