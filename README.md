@@ -1,6 +1,6 @@
 # Token Usage Tracker
 
-![Extension Screenshot](1.png)
+![Extension Screenshot](1.jpg)
 
 A SillyTavern extension that tracks and visualizes token usage and price for your chats.
 
