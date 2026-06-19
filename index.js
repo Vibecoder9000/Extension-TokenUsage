@@ -217,12 +217,13 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, a
     if (modelId) {
         if (!usage.byDay[dayKey].models) usage.byDay[dayKey].models = {};
         if (!usage.byDay[dayKey].models[modelId]) {
-            usage.byDay[dayKey].models[modelId] = { input: 0, output: 0, total: 0 };
+            usage.byDay[dayKey].models[modelId] = { input: 0, output: 0, total: 0, messageCount: 0 };
         }
         const modelData = usage.byDay[dayKey].models[modelId];
         modelData.input += inputTokens;
         modelData.output += outputTokens;
         modelData.total += totalTokens;
+        modelData.messageCount = (modelData.messageCount || 0) + 1;
         if (exactCost !== null) {
             modelData.cost = (modelData.cost || 0) + exactCost;
             modelData.costedInput = (modelData.costedInput || 0) + inputTokens;
@@ -1419,13 +1420,15 @@ function formatPricePerMillion(price) {
     return `$${value.toFixed(4).replace(/\.?0+$/, '')}/1M`;
 }
 
-function renderInputOutputRows(prefix, input, output, valueFontSize = '14px') {
+function renderInputOutputRows(prefix, input, output, requests, valueFontSize = '14px') {
     return `
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1px 10px; color: var(--SmartThemeBodyColor);">
+        <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px 10px; color: var(--SmartThemeBodyColor);">
             <div style="font-size: 10px; opacity: 0.75;">In</div>
             <div style="font-size: 10px; opacity: 0.75;">Out</div>
+            <div style="font-size: 10px; opacity: 0.75;">Requests</div>
             <div id="token-usage-${prefix}-in" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor);">${formatNumberFull(input || 0)}</div>
             <div id="token-usage-${prefix}-out" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor);">${formatNumberFull(output || 0)}</div>
+            <div id="token-usage-${prefix}-requests" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor);">${formatNumberFull(requests || 0)}</div>
         </div>
     `;
 }
@@ -1435,7 +1438,7 @@ function renderUsageStatCard(title, prefix, data, cost = '$0.00') {
         <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); overflow: hidden; display: flex;">
             <div style="flex: 1; padding: 6px 8px;">
                 <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5; margin-bottom: 4px;">${title}</div>
-                ${renderInputOutputRows(prefix, data.input, data.output)}
+                ${renderInputOutputRows(prefix, data.input, data.output, data.messageCount)}
             </div>
             <div style="width: 1px; background: var(--SmartThemeBorderColor);"></div>
             <div style="flex: 0 0 78px; padding: 6px 8px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;">
@@ -1497,7 +1500,7 @@ function getChartData(days) {
         const date = new Date(today);
         date.setDate(date.getDate() - i);
         const dayKey = getDayKey(date);
-        const dayData = byDay[dayKey] || { total: 0, input: 0, output: 0, models: {} };
+        const dayData = byDay[dayKey] || { total: 0, input: 0, output: 0, messageCount: 0, models: {} };
 
         data.push({
             date: date,
@@ -1505,6 +1508,7 @@ function getChartData(days) {
             usage: dayData.total || 0,
             input: dayData.input || 0,
             output: dayData.output || 0,
+            messageCount: dayData.messageCount || 0,
             models: dayData.models || {},
             displayDate: new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(date),
             fullDate: new Intl.DateTimeFormat('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }).format(date),
@@ -1739,13 +1743,14 @@ function showTooltip(d) {
     if (d.models && Object.keys(d.models).length > 0) {
         const getModelTokenBreakdown = (value) => {
             if (typeof value === 'number') {
-                return { total: value, input: null, output: null };
+                return { total: value, input: null, output: null, messageCount: null };
             }
 
             const input = Number(value?.input) || 0;
             const output = Number(value?.output) || 0;
             const total = Number(value?.total) || (input + output);
-            return { total, input, output };
+            const messageCount = Number(value?.messageCount);
+            return { total, input, output, messageCount: Number.isFinite(messageCount) ? messageCount : null };
         };
 
         const modelEntries = Object.entries(d.models).sort((a, b) => getModelTokenBreakdown(a[1]).total - getModelTokenBreakdown(b[1]).total); // Sort ascending (smallest first, like graph bottom-up)
@@ -1756,14 +1761,14 @@ function showTooltip(d) {
             modelBreakdown += `<div style="font-size: 9px; color: rgba(255,255,255,0.3); margin-bottom: 2px;">+${hiddenEntryCount} more</div>`;
         }
         for (const [model, modelData] of displayEntries) {
-            const { total, input, output } = getModelTokenBreakdown(modelData);
+            const { total, input, output, messageCount } = getModelTokenBreakdown(modelData);
             const percent = d.usage > 0 ? Math.round((total / d.usage) * 100) : 0;
             const shortName = model.length > 25 ? model.substring(0, 22) + '...' : model;
             const color = getModelColor(model);
             const breakdownLines = input !== null && output !== null
                 ? `
                     <div style="margin-top: 0; margin-left: 12px; color: rgba(255,255,255,0.65); line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
-                        ${formatNumberFull(input)} | ${formatNumberFull(output)}
+                        ${formatNumberFull(input)} | ${formatNumberFull(output)}${messageCount !== null ? ` | ${formatNumberFull(messageCount)}` : ''}
                     </div>
                 `
                 : `
@@ -1789,11 +1794,13 @@ function showTooltip(d) {
     tooltip.innerHTML = `
         <div style="font-weight: 600; margin-bottom: 2px; color: var(--SmartThemeBodyColor);">${d.fullDate}</div>
         <div style="font-size: 12px; font-weight: 600; color: var(--SmartThemeBodyColor); margin-bottom: 4px;">${formatCost(tooltipCost)}</div>
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1px 10px; font-size: 10px; color: var(--SmartThemeBodyColor); margin-bottom: 2px;">
+        <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px 10px; font-size: 10px; color: var(--SmartThemeBodyColor); margin-bottom: 2px;">
             <div style="opacity: 0.6;">In</div>
             <div style="opacity: 0.6;">Out</div>
+            <div style="opacity: 0.6;">Requests</div>
             <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.input)}</div>
             <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.output)}</div>
+            <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.messageCount)}</div>
         </div>
         ${modelBreakdown}
     `;
@@ -1857,17 +1864,21 @@ function updateUIStats() {
     const stats = getUsageStats();
     const now = new Date();
 
-    // Today header
+    // Today stats
     $('#token-usage-today-in').text(formatNumberFull(stats.today.input || 0));
     $('#token-usage-today-out').text(formatNumberFull(stats.today.output || 0));
+    $('#token-usage-today-requests').text(formatNumberFull(stats.today.messageCount || 0));
 
     // Stats grid
     $('#token-usage-week-in').text(formatNumberFull(stats.thisWeek.input || 0));
     $('#token-usage-week-out').text(formatNumberFull(stats.thisWeek.output || 0));
+    $('#token-usage-week-requests').text(formatNumberFull(stats.thisWeek.messageCount || 0));
     $('#token-usage-month-in').text(formatNumberFull(stats.thisMonth.input || 0));
     $('#token-usage-month-out').text(formatNumberFull(stats.thisMonth.output || 0));
+    $('#token-usage-month-requests').text(formatNumberFull(stats.thisMonth.messageCount || 0));
     $('#token-usage-alltime-in').text(formatNumberFull(stats.allTime.input || 0));
     $('#token-usage-alltime-out').text(formatNumberFull(stats.allTime.output || 0));
+    $('#token-usage-alltime-requests').text(formatNumberFull(stats.allTime.messageCount || 0));
 
     // Cost calculations
     const allTimeCost = calculateAllTimeCost();
@@ -2021,28 +2032,20 @@ function createSettingsUI() {
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
                 <div class="inline-drawer-content">
-                    <!-- Chart Header: Today stats + Range selector -->
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                        <div style="display: grid; gap: 3px;">
-                            <div style="display: flex; align-items: baseline; gap: 6px;">
-                                <span style="font-size: 11px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Today</span>
-                                <span id="token-usage-today-cost" style="font-size: 12px; color: var(--SmartThemeBodyColor); opacity: 0.8;">$0.00</span>
-                            </div>
-                            ${renderInputOutputRows('today', stats.today.input, stats.today.output, '16px')}
-                        </div>
-                        <div style="display: inline-flex; flex-wrap: wrap; justify-content: flex-end; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 6px; padding: 2px;">
+                    <!-- Chart -->
+                    <div class="token-usage-chart-shell" style="margin-bottom: 12px;">
+                        <div class="token-usage-range-controls" style="display: inline-flex; flex-wrap: wrap; justify-content: flex-end;">
                             <button class="token-usage-range-btn menu_button" data-value="7" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">7D</button>
                             <button class="token-usage-range-btn menu_button active" data-value="30" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">30D</button>
                             <button class="token-usage-range-btn menu_button" data-value="90" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">90D</button>
                             <button class="token-usage-range-btn menu_button" data-value="365" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">365D</button>
                         </div>
+                        <div id="token-usage-chart" style="width: 100%; height: 320px; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 8px; overflow: hidden;"></div>
                     </div>
 
-                    <!-- Chart -->
-                    <div id="token-usage-chart" style="width: 100%; height: 320px; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 8px; overflow: hidden; margin-bottom: 12px;"></div>
-
-                    <!-- Stats Grid (Week, Month, All Time) -->
-                    <div class="token-usage-stats-grid" style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 10px;">
+                    <!-- Stats Grid (Today, Week, Month, All Time) -->
+                    <div class="token-usage-stats-grid" style="display: grid; gap: 6px; margin-bottom: 10px;">
+                        ${renderUsageStatCard('Today', 'today', stats.today)}
                         ${renderUsageStatCard('This Week', 'week', stats.thisWeek)}
                         ${renderUsageStatCard('This Month', 'month', stats.thisMonth)}
                         ${renderUsageStatCard('All Time', 'alltime', stats.allTime)}

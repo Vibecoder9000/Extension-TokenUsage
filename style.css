@@ -30,3 +30,29 @@
 .model-config-row {
   padding: 2px 0;
 }
+
+.token-usage-chart-shell {
+  position: relative;
+}
+
+.token-usage-range-controls {
+  position: absolute;
+  top: 12px;
+  left: 6px;
+  z-index: 2;
+}
+
+/* Adaptive layout for the week/month/all-time stat cards */
+.token-usage-stats-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.token-usage-stat-card {
+  min-width: 0;
+}
+
+@media (max-width: 560px) {
+  .token-usage-stats-grid {
+    grid-template-columns: 1fr;
+  }
+}
