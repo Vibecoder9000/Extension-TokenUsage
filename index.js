@@ -367,6 +367,7 @@ function parseApiUsage(apiUsage) {
 
     const readNumber = (...values) => {
         for (const value of values) {
+            if (value === null || value === undefined || value === '') continue;
             const parsed = Number(value);
             if (Number.isFinite(parsed)) return parsed;
         }
@@ -882,7 +883,7 @@ function getModelLookupCandidates(modelId) {
     if (!raw) return [];
 
     const candidates = new Set();
-    const suffixPattern = /(?:[\s._:-]+)(?:it|instruct|chat|thinking|reasoning|agentic|free)$/i;
+    const suffixPattern = /(?:[\s._:-]+)(?:it|instruct|chat|agentic|free)$/i;
     const addCandidate = (value) => {
         const trimmed = String(value || '').trim();
         if (!trimmed) return;
@@ -986,7 +987,9 @@ function tokenizeModelIdForLookup(modelId) {
 function extractVersionInfo(modelId) {
     const composite = new Set();
     const major = new Set();
-    const value = String(modelId || '').toLowerCase();
+    let value = String(modelId || '').toLowerCase();
+    value = value.replace(/([a-z])(\d)/g, '$1 $2');
+    value = value.replace(/(\d)([a-z])/g, '$1 $2');
 
     const compositeRegex = /(^|[^0-9])(\d+(?:[._-]\d+)+)(?=$|[^0-9])/g;
     let match;
@@ -1086,8 +1089,15 @@ function semanticMatchScore(queryProfile, targetProfile) {
     const precision = common / querySize;
     if (precision < 0.5) return Number.NEGATIVE_INFINITY;
 
+    let versionPenalty = 0;
     if (queryProfile.compositeVersions.size > 0) {
-        if (!hasIntersection(queryProfile.compositeVersions, targetProfile.compositeVersions)) {
+        if (targetProfile.compositeVersions.size > 0) {
+            if (!hasIntersection(queryProfile.compositeVersions, targetProfile.compositeVersions)) {
+                return Number.NEGATIVE_INFINITY;
+            }
+        } else if (hasIntersection(queryProfile.majorVersions, targetProfile.majorVersions)) {
+            versionPenalty += 3;
+        } else {
             return Number.NEGATIVE_INFINITY;
         }
     } else if (queryProfile.majorVersions.size > 0) {
@@ -1106,6 +1116,14 @@ function semanticMatchScore(queryProfile, targetProfile) {
             qualifierPenalty += 1;
         }
     }
+    for (const qualifier of queryProfile.qualifiers) {
+        if (!targetProfile.qualifiers.has(qualifier)) {
+            qualifierPenalty += 5;
+        } else {
+            score += 2;
+        }
+    }
+    score -= versionPenalty;
     score -= qualifierPenalty * 2;
     if (targetProfile.isFree) {
         score -= 1;
@@ -1114,12 +1132,12 @@ function semanticMatchScore(queryProfile, targetProfile) {
     return score;
 }
 
-function resolveSemanticPriceMatch(lookupCandidates) {
+function resolveSemanticPriceMatch(lookupCandidates, priceProfiles = openRouterPriceProfiles) {
     let best = null;
 
     for (const candidate of lookupCandidates) {
         const queryProfile = buildLookupProfile(candidate);
-        for (const targetProfile of openRouterPriceProfiles) {
+        for (const targetProfile of priceProfiles) {
             const score = semanticMatchScore(queryProfile, targetProfile);
             if (!Number.isFinite(score)) continue;
 
@@ -1147,6 +1165,7 @@ function resolveSemanticPriceMatch(lookupCandidates) {
 const openRouterNormalizedPriceLookupMap = buildNormalizedPriceLookupMap(pricing);
 const openRouterPriceProfiles = Object.keys(pricing).map(buildLookupProfile);
 let manualNormalizedPriceLookupMap = null;
+let manualPriceProfiles = null;
 
 /**
  * Sanitize and validate a price object.
@@ -1174,6 +1193,7 @@ function resolveModelPrice(modelId) {
     const lookupCandidates = getModelLookupCandidates(modelId);
     if (!manualNormalizedPriceLookupMap) {
         manualNormalizedPriceLookupMap = buildNormalizedPriceLookupMap(manualPrices);
+        manualPriceProfiles = Object.keys(manualPrices).map(buildLookupProfile);
     }
 
     // 1) Manual exact
@@ -1196,7 +1216,16 @@ function resolveModelPrice(modelId) {
         }
     }
 
-    // 3) Built-in exact
+    // 3) Manual semantic
+    const manualSemanticMatch = resolveSemanticPriceMatch(lookupCandidates, manualPriceProfiles || []);
+    if (manualSemanticMatch && Object.prototype.hasOwnProperty.call(manualPrices, manualSemanticMatch)) {
+        const parsed = parsePriceObject(manualPrices[manualSemanticMatch]);
+        if (parsed) {
+            return { resolved: true, ...parsed, source: 'manual-semantic', matchedModelId: manualSemanticMatch };
+        }
+    }
+
+    // 4) Built-in exact
     if (Object.prototype.hasOwnProperty.call(pricing, modelId)) {
         const parsed = parsePriceObject(pricing[modelId]);
         if (parsed) {
@@ -1204,7 +1233,7 @@ function resolveModelPrice(modelId) {
         }
     }
 
-    // 4) Built-in normalized
+    // 5) Built-in normalized
     for (const candidate of lookupCandidates) {
         const normalized = normalizeModelIdForLookup(candidate);
         const matched = openRouterNormalizedPriceLookupMap.get(normalized);
@@ -1216,7 +1245,7 @@ function resolveModelPrice(modelId) {
         }
     }
 
-    // 5) Semantic fallback (token/version aware)
+    // 6) Semantic fallback (token/version aware)
     const semanticMatch = resolveSemanticPriceMatch(lookupCandidates);
     if (semanticMatch && Object.prototype.hasOwnProperty.call(pricing, semanticMatch)) {
         const parsed = parsePriceObject(pricing[semanticMatch]);
@@ -1342,6 +1371,7 @@ function setModelPrice(modelId, priceIn, priceOut) {
         out: normalizePrice(priceOut),
     };
     manualNormalizedPriceLookupMap = null;
+    manualPriceProfiles = null;
     saveSettings();
 }
 
@@ -1370,6 +1400,50 @@ function calculateStoredOrEstimatedCost(data, modelId) {
     const residualInput = Math.max(0, (data.input || 0) - (data.costedInput || 0));
     const residualOutput = Math.max(0, (data.output || 0) - (data.costedOutput || 0));
     return exactCost + calculateCost(residualInput, residualOutput, modelId);
+}
+
+function formatCost(cost) {
+    const value = Number(cost) || 0;
+    if (value > 0 && value < 0.01) return '<$0.01';
+    return `$${value.toFixed(2)}`;
+}
+
+function formatPricePerMillion(price) {
+    const value = Number(price);
+    if (!Number.isFinite(value) || value < 0) return null;
+    if (value === 0) return '$0/1M';
+    if (value >= 100) return `$${value.toFixed(0)}/1M`;
+    if (value >= 10) return `$${value.toFixed(1)}/1M`;
+    if (value >= 1) return `$${value.toFixed(2)}/1M`;
+    if (value >= 0.01) return `$${value.toFixed(3).replace(/\.?0+$/, '')}/1M`;
+    return `$${value.toFixed(4).replace(/\.?0+$/, '')}/1M`;
+}
+
+function renderInputOutputRows(prefix, input, output, valueFontSize = '14px') {
+    return `
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1px 10px; color: var(--SmartThemeBodyColor);">
+            <div style="font-size: 10px; opacity: 0.75;">In</div>
+            <div style="font-size: 10px; opacity: 0.75;">Out</div>
+            <div id="token-usage-${prefix}-in" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor);">${formatNumberFull(input || 0)}</div>
+            <div id="token-usage-${prefix}-out" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor);">${formatNumberFull(output || 0)}</div>
+        </div>
+    `;
+}
+
+function renderUsageStatCard(title, prefix, data, cost = '$0.00') {
+    return `
+        <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); overflow: hidden; display: flex;">
+            <div style="flex: 1; padding: 6px 8px;">
+                <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5; margin-bottom: 4px;">${title}</div>
+                ${renderInputOutputRows(prefix, data.input, data.output)}
+            </div>
+            <div style="width: 1px; background: var(--SmartThemeBorderColor);"></div>
+            <div style="flex: 0 0 78px; padding: 6px 8px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;">
+                <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Cost</div>
+                <span style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-${prefix}-cost">${cost}</span>
+            </div>
+        </div>
+    `;
 }
 
 /**
@@ -1527,7 +1601,7 @@ function renderChart() {
     let barWidth = totalBarWidth * 0.8;
     if (barWidth > 40) barWidth = 40;
     const actualGap = totalBarWidth - barWidth;
-    const labelInterval = currentChartRange === 90 ? 7 : currentChartRange === 30 ? 3 : 1;
+    const labelInterval = currentChartRange >= 365 ? 30 : currentChartRange >= 90 ? 7 : currentChartRange >= 30 ? 3 : 1;
 
     chartData.forEach((d, i) => {
         const slotX = margin.left + (i * totalBarWidth);
@@ -1653,37 +1727,74 @@ function renderChart() {
 function showTooltip(d) {
     if (!tooltip) return;
 
+    let tooltipCost = 0;
+    if (d.models && Object.keys(d.models).length > 0) {
+        for (const [modelId, modelData] of Object.entries(d.models)) {
+            tooltipCost += calculateStoredOrEstimatedCost(modelData, modelId) || 0;
+        }
+    }
+
     // Build model breakdown HTML
     let modelBreakdown = '';
     if (d.models && Object.keys(d.models).length > 0) {
-        // Extract total from new object format or use number directly for legacy
-        const getTokens = (v) => typeof v === 'number' ? v : (v.total || 0);
-        const modelEntries = Object.entries(d.models).sort((a, b) => getTokens(a[1]) - getTokens(b[1])); // Sort ascending (smallest first, like graph bottom-up)
-        modelBreakdown = '<div style="margin-top: 4px; padding-top: 4px; border-top: 1px solid rgba(255,255,255,0.2);">';
+        const getModelTokenBreakdown = (value) => {
+            if (typeof value === 'number') {
+                return { total: value, input: null, output: null };
+            }
+
+            const input = Number(value?.input) || 0;
+            const output = Number(value?.output) || 0;
+            const total = Number(value?.total) || (input + output);
+            return { total, input, output };
+        };
+
+        const modelEntries = Object.entries(d.models).sort((a, b) => getModelTokenBreakdown(a[1]).total - getModelTokenBreakdown(b[1]).total); // Sort ascending (smallest first, like graph bottom-up)
+        modelBreakdown = '<div style="margin-top: 2px; padding-top: 3px; border-top: 1px solid rgba(255,255,255,0.2);">';
+        const hiddenEntryCount = Math.max(0, modelEntries.length - 8);
         const displayEntries = modelEntries.slice(-8); // Show last 8 (the largest)
+        if (hiddenEntryCount > 0) {
+            modelBreakdown += `<div style="font-size: 9px; color: rgba(255,255,255,0.3); margin-bottom: 2px;">+${hiddenEntryCount} more</div>`;
+        }
         for (const [model, modelData] of displayEntries) {
-            const tokens = getTokens(modelData);
-            const percent = d.usage > 0 ? Math.round((tokens / d.usage) * 100) : 0;
+            const { total, input, output } = getModelTokenBreakdown(modelData);
+            const percent = d.usage > 0 ? Math.round((total / d.usage) * 100) : 0;
             const shortName = model.length > 25 ? model.substring(0, 22) + '...' : model;
             const color = getModelColor(model);
-            modelBreakdown += `<div style="font-size: 9px; color: rgba(255,255,255,0.5); display: flex; align-items: center; justify-content: space-between; gap: 8px;">
-                <div style="display: flex; align-items: center; gap: 4px; min-width: 0;">
-                    <span style="display: inline-block; width: 8px; height: 8px; background: ${color}; border-radius: 2px; flex-shrink: 0;"></span>
-                    <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${shortName}</span>
+            const breakdownLines = input !== null && output !== null
+                ? `
+                    <div style="margin-top: 0; margin-left: 12px; color: rgba(255,255,255,0.65); line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                        ${formatNumberFull(input)} | ${formatNumberFull(output)}
+                    </div>
+                `
+                : `
+                    <div style="margin-top: 0; margin-left: 12px; color: rgba(255,255,255,0.65); line-height: 1.15;">
+                        <div>Total: ${formatNumberFull(total)}</div>
+                    </div>
+                `;
+
+            modelBreakdown += `<div style="font-size: 9px; color: rgba(255,255,255,0.5); margin-bottom: 2px;">
+                <div style="display: flex; align-items: center; justify-content: space-between; gap: 6px;">
+                    <div style="display: flex; align-items: center; gap: 4px; min-width: 0;">
+                        <span style="display: inline-block; width: 7px; height: 7px; background: ${color}; border-radius: 2px; flex-shrink: 0;"></span>
+                        <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${shortName}</span>
+                    </div>
+                    <span style="flex-shrink: 0;">${percent}%</span>
                 </div>
-                <span style="flex-shrink: 0;">${formatTokens(tokens)} (${percent}%)</span>
+                ${breakdownLines}
             </div>`;
-        }
-        if (modelEntries.length > 8) {
-            modelBreakdown += `<div style="font-size: 9px; color: rgba(255,255,255,0.3);">+${modelEntries.length - 8} more</div>`;
         }
         modelBreakdown += '</div>';
     }
 
     tooltip.innerHTML = `
         <div style="font-weight: 600; margin-bottom: 2px; color: var(--SmartThemeBodyColor);">${d.fullDate}</div>
-        <div style="color: var(--SmartThemeBodyColor);">${formatNumberFull(d.usage)} tokens</div>
-        <div style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.6;">${formatNumberFull(d.input)} in / ${formatNumberFull(d.output)} out</div>
+        <div style="font-size: 12px; font-weight: 600; color: var(--SmartThemeBodyColor); margin-bottom: 4px;">${formatCost(tooltipCost)}</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1px 10px; font-size: 10px; color: var(--SmartThemeBodyColor); margin-bottom: 2px;">
+            <div style="opacity: 0.6;">In</div>
+            <div style="opacity: 0.6;">Out</div>
+            <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.input)}</div>
+            <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.output)}</div>
+        </div>
         ${modelBreakdown}
     `;
     tooltip.style.display = 'block';
@@ -1747,18 +1858,20 @@ function updateUIStats() {
     const now = new Date();
 
     // Today header
-    $('#token-usage-today-total').text(formatTokens(stats.today.total));
-    $('#token-usage-today-in').text(formatTokens(stats.today.input || 0));
-    $('#token-usage-today-out').text(formatTokens(stats.today.output || 0));
+    $('#token-usage-today-in').text(formatNumberFull(stats.today.input || 0));
+    $('#token-usage-today-out').text(formatNumberFull(stats.today.output || 0));
 
     // Stats grid
-    $('#token-usage-week-total').text(formatTokens(stats.thisWeek.total));
-    $('#token-usage-month-total').text(formatTokens(stats.thisMonth.total));
-    $('#token-usage-alltime-total').text(formatTokens(stats.allTime.total));
+    $('#token-usage-week-in').text(formatNumberFull(stats.thisWeek.input || 0));
+    $('#token-usage-week-out').text(formatNumberFull(stats.thisWeek.output || 0));
+    $('#token-usage-month-in').text(formatNumberFull(stats.thisMonth.input || 0));
+    $('#token-usage-month-out').text(formatNumberFull(stats.thisMonth.output || 0));
+    $('#token-usage-alltime-in').text(formatNumberFull(stats.allTime.input || 0));
+    $('#token-usage-alltime-out').text(formatNumberFull(stats.allTime.output || 0));
 
     // Cost calculations
     const allTimeCost = calculateAllTimeCost();
-    $('#token-usage-alltime-cost').text(`$${allTimeCost.toFixed(2)}`);
+    $('#token-usage-alltime-cost').text(formatCost(allTimeCost));
 
     // For Week/Month: We iterate all `byDay` keys and match those that belong to current week/month
     const currentWeekKey = getWeekKey(now);
@@ -1801,9 +1914,9 @@ function updateUIStats() {
         }
     }
 
-    $('#token-usage-week-cost').text(`$${weekCost.toFixed(2)}`);
-    $('#token-usage-month-cost').text(`$${monthCost.toFixed(2)}`);
-    $('#token-usage-today-cost').text(`$${todayCost.toFixed(2)}`);
+    $('#token-usage-week-cost').text(formatCost(weekCost));
+    $('#token-usage-month-cost').text(formatCost(monthCost));
+    $('#token-usage-today-cost').text(formatCost(todayCost));
 
     $('#token-usage-tokenizer').text('Tokenizer: ' + (stats.tokenizer || 'Unknown'));
 
@@ -1910,21 +2023,18 @@ function createSettingsUI() {
                 <div class="inline-drawer-content">
                     <!-- Chart Header: Today stats + Range selector -->
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                        <div>
+                        <div style="display: grid; gap: 3px;">
                             <div style="display: flex; align-items: baseline; gap: 6px;">
-                                <span style="font-size: 18px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-today-total">${formatTokens(stats.today.total)}</span>
+                                <span style="font-size: 11px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Today</span>
                                 <span id="token-usage-today-cost" style="font-size: 12px; color: var(--SmartThemeBodyColor); opacity: 0.8;">$0.00</span>
-                                <span style="font-size: 11px; color: var(--SmartThemeBodyColor); opacity: 0.5;"> today</span>
                             </div>
-                            <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.4;">
-                                <span id="token-usage-today-in">${formatTokens(stats.today.input || 0)}</span> in /
-                                <span id="token-usage-today-out">${formatTokens(stats.today.output || 0)}</span> out
-                            </div>
+                            ${renderInputOutputRows('today', stats.today.input, stats.today.output, '16px')}
                         </div>
-                        <div style="display: inline-flex; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 6px; padding: 2px;">
+                        <div style="display: inline-flex; flex-wrap: wrap; justify-content: flex-end; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 6px; padding: 2px;">
                             <button class="token-usage-range-btn menu_button" data-value="7" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">7D</button>
                             <button class="token-usage-range-btn menu_button active" data-value="30" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">30D</button>
                             <button class="token-usage-range-btn menu_button" data-value="90" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">90D</button>
+                            <button class="token-usage-range-btn menu_button" data-value="365" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">365D</button>
                         </div>
                     </div>
 
@@ -1933,36 +2043,9 @@ function createSettingsUI() {
 
                     <!-- Stats Grid (Week, Month, All Time) -->
                     <div class="token-usage-stats-grid" style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 10px;">
-                        <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); overflow: hidden; display: flex;">
-                            <div style="flex: 1; padding: 4px 8px;">
-                                <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">This Week</div>
-                                <div style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-week-total">${formatTokens(stats.thisWeek.total)}</div>
-                            </div>
-                            <div style="width: 1px; background: var(--SmartThemeBorderColor);"></div>
-                            <div style="flex: 1; padding: 4px 8px; display: flex; align-items: center; justify-content: center;">
-                                <span style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-week-cost">$0.00</span>
-                            </div>
-                        </div>
-                        <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); overflow: hidden; display: flex;">
-                            <div style="flex: 1; padding: 4px 8px;">
-                                <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">This Month</div>
-                                <div style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-month-total">${formatTokens(stats.thisMonth.total)}</div>
-                            </div>
-                            <div style="width: 1px; background: var(--SmartThemeBorderColor);"></div>
-                            <div style="flex: 1; padding: 4px 8px; display: flex; align-items: center; justify-content: center;">
-                                <span style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-month-cost">$0.00</span>
-                            </div>
-                        </div>
-                        <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); overflow: hidden; display: flex;">
-                            <div style="flex: 1; padding: 4px 8px;">
-                                <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">All Time</div>
-                                <div style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-alltime-total">${formatTokens(stats.allTime.total)}</div>
-                            </div>
-                            <div style="width: 1px; background: var(--SmartThemeBorderColor);"></div>
-                            <div style="flex: 1; padding: 4px 8px; display: flex; align-items: center; justify-content: center;">
-                                <span style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-alltime-cost">$0.00</span>
-                            </div>
-                        </div>
+                        ${renderUsageStatCard('This Week', 'week', stats.thisWeek)}
+                        ${renderUsageStatCard('This Month', 'month', stats.thisMonth)}
+                        ${renderUsageStatCard('All Time', 'alltime', stats.allTime)}
                     </div>
 
                     <!-- Config (Model Colors & Prices) -->
@@ -2005,7 +2088,7 @@ function createSettingsUI() {
     if (!document.getElementById('token-usage-tooltip')) {
         const tooltipEl = document.createElement('div');
         tooltipEl.id = 'token-usage-tooltip';
-        tooltipEl.style.cssText = 'position: fixed; display: none; background: rgba(0,0,0,0.9); color: white; padding: 8px 12px; border-radius: 6px; font-size: 11px; pointer-events: none; z-index: 9999; box-shadow: 0 4px 12px rgba(0,0,0,0.3);';
+        tooltipEl.style.cssText = 'position: fixed; display: none; background: rgba(0,0,0,0.9); color: white; padding: 6px 10px; border-radius: 6px; font-size: 11px; pointer-events: none; z-index: 9999; box-shadow: 0 4px 12px rgba(0,0,0,0.3);';
         document.body.appendChild(tooltipEl);
         console.log('[Token Usage Tracker] Tooltip appended to body');
     }
