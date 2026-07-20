@@ -4,13 +4,12 @@
  *
  * Uses SillyTavern's native tokenizer system for accurate counting:
  * - getTokenCountAsync() for async token counting
- * - getTextTokens() for getting actual token IDs when available
  * - Respects user's tokenizer settings (BEST_MATCH, model-specific, etc.)
  */
 
 import { eventSource, event_types, main_api, streamingProcessor, saveSettingsDebounced } from '../../../../script.js';
 import { extension_settings, getContext } from '../../../extensions.js';
-import { getTokenCountAsync, getTextTokens, getFriendlyTokenizerName, tokenizers } from '../../../tokenizers.js';
+import { getTokenCountAsync, getFriendlyTokenizerName } from '../../../tokenizers.js';
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 import { getGeneratingModel } from '../../../../script.js';
@@ -138,7 +137,7 @@ function getMonthKey(date = new Date()) {
 
 /**
  * Count tokens using SillyTavern's native tokenizer
- * Uses getTextTokens for accurate IDs when available, falls back to getTokenCountAsync
+ * Uses SillyTavern's asynchronous tokenizer API and its token cache.
  * @param {string} text - Text to tokenize
  * @returns {Promise<number>} Token count
  */
@@ -146,18 +145,9 @@ async function countTokens(text) {
     if (!text || typeof text !== 'string') return 0;
 
     try {
-        // Get the current tokenizer based on user settings and API
-        const { tokenizerId } = getFriendlyTokenizerName(main_api);
-
-        // Try to get actual token IDs first (more accurate)
-        const tokenizerType = main_api === 'openai' ? tokenizers.OPENAI : tokenizerId;
-        const tokenIds = getTextTokens(tokenizerType, text);
-
-        if (Array.isArray(tokenIds) && tokenIds.length > 0) {
-            return tokenIds.length;
-        }
-
-        // Fall back to async count (uses caching)
+        // getTextTokens() performs a synchronous XHR for server tokenizers, which
+        // blocks the Generate flow until the tokenizer responds. The async count
+        // API uses the same configured tokenizer and cache without freezing the UI.
         return await getTokenCountAsync(text);
     } catch (error) {
         console.error('[Token Usage Tracker] Error counting tokens:', error);
