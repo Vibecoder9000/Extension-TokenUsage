@@ -162,7 +162,7 @@ async function countTokens(text) {
  * @param {number} outputTokens - Tokens in the AI response
  * @param {string} [chatId] - Optional chat ID for per-chat tracking
  * @param {string} [modelId] - Optional model ID for per-model tracking
- * @param {{cost?: number|null, source?: string|null}} [apiUsage] - Optional API-reported usage metadata
+ * @param {{cost?: number|null, source?: string|null, hasTokenCounts?: boolean}} [apiUsage] - Optional API-reported usage metadata
  */
 function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, apiUsage = {}) {
     const settings = getSettings();
@@ -223,8 +223,14 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, a
     // Emit custom event for UI updates
     eventSource.emit('tokenUsageUpdated', getUsageStats());
 
-    const costLog = exactCost !== null ? `, cost: $${exactCost.toFixed(6)} (${apiUsage.source || 'api'})` : '';
-    console.log(`[Token Usage Tracker] Recorded: +${inputTokens} input, +${outputTokens} output, model: ${modelId || 'unknown'}${costLog} (using ${getFriendlyTokenizerName(main_api).tokenizerName})`);
+    const estimatedCost = exactCost === null ? calculateCost(inputTokens, outputTokens, modelId) : 0;
+    const costLog = exactCost !== null
+        ? `, cost: $${exactCost.toFixed(6)} (reported by API)`
+        : estimatedCost > 0
+            ? `, cost: $${estimatedCost.toFixed(6)} (model pricing)`
+            : '';
+    const countSource = apiUsage?.hasTokenCounts ? 'reported by API' : `counted with ${getFriendlyTokenizerName(main_api).tokenizerName}`;
+    console.log(`[Token Usage Tracker] Recorded: +${inputTokens} input, +${outputTokens} output, model: ${modelId || 'unknown'}${costLog} (${countSource})`);
 }
 
 /**
@@ -341,52 +347,27 @@ function getUsageForRange(startDate, endDate) {
 }
 
 /**
- * Extract API-reported token usage saved by SillyTavern core, when available.
- * Supports OpenAI/OpenRouter, Claude-like, Cohere, and Gemini usage shapes.
+ * Parses the OpenAI-compatible usage shape returned by Meta Model API.
  * @param {any} apiUsage
- * @returns {{input: number, output: number, total: number, cost: number|null, source: string}|null}
+ * @returns {{input: number, output: number, total: number, cost: number|null, source: string, hasTokenCounts: true}|null}
  */
 function parseApiUsage(apiUsage) {
     if (!apiUsage || typeof apiUsage !== 'object') return null;
 
-    const readNumber = (...values) => {
-        for (const value of values) {
-            if (value === null || value === undefined || value === '') continue;
-            const parsed = Number(value);
-            if (Number.isFinite(parsed)) return parsed;
-        }
+    const input = apiUsage.prompt_tokens;
+    const output = apiUsage.completion_tokens;
+    const total = apiUsage.total_tokens;
+    if (typeof input !== 'number' || !Number.isFinite(input) || input < 0
+        || typeof output !== 'number' || !Number.isFinite(output) || output < 0
+        || typeof total !== 'number' || !Number.isFinite(total) || total < 0) {
         return null;
-    };
+    }
 
-    const input = readNumber(
-        apiUsage.prompt_tokens,
-        apiUsage.input_tokens,
-        apiUsage.promptTokenCount,
-    );
-    const output = readNumber(
-        apiUsage.completion_tokens,
-        apiUsage.output_tokens,
-        apiUsage.candidatesTokenCount,
-    );
-    const total = readNumber(
-        apiUsage.total_tokens,
-        apiUsage.totalTokenCount,
-        input !== null && output !== null ? input + output : null,
-    );
-    const cost = readNumber(
-        apiUsage.cost,
-        apiUsage.cost_details?.upstream_inference_cost,
-    );
+    const rawCost = apiUsage.cost ?? apiUsage.cost_details?.upstream_inference_cost;
+    const parsedCost = rawCost === null || rawCost === undefined || rawCost === '' ? null : Number(rawCost);
+    const cost = Number.isFinite(parsedCost) && parsedCost >= 0 ? parsedCost : null;
 
-    if (input === null && output === null && total === null && cost === null) return null;
-
-    return {
-        input: input || 0,
-        output: output || 0,
-        total: total || (input || 0) + (output || 0),
-        cost,
-        source: 'api_usage',
-    };
+    return { input, output, total, cost, source: 'api_usage', hasTokenCounts: true };
 }
 
 /**
@@ -593,12 +574,12 @@ async function handleMessageReceived(messageIndex, type) {
         if (!message || !message.mes) return;
 
         const apiUsage = parseApiUsage(message.extra?.api_usage);
-        let outputTokens;
         let inputTokens;
+        let outputTokens;
 
         if (apiUsage) {
             inputTokens = apiUsage.input;
-            outputTokens = apiUsage.output || Math.max(0, apiUsage.total - apiUsage.input);
+            outputTokens = apiUsage.output;
             console.log(`[Token Usage Tracker] Using API-reported usage: ${inputTokens} in, ${outputTokens} out${apiUsage.cost !== null ? `, $${apiUsage.cost.toFixed(6)}` : ''}`);
         } else {
             // Use SillyTavern's pre-calculated token count if available.

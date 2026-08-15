@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const OPENROUTER_MODELS_API = 'https://openrouter.ai/api/v1/models';
-const OPENROUTER_EFFECTIVE_PRICING_API = 'https://openrouter.ai/api/frontend/stats/effective-pricing';
+const OPENROUTER_EFFECTIVE_PRICING_API = 'https://openrouter.ai/api/frontend/v1/stats/effective-pricing';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -63,15 +63,14 @@ async function main() {
     const models = Array.isArray(modelsPayload?.data) ? modelsPayload.data : [];
     const modelIds = models.map(m => m?.id).filter(Boolean);
 
-    const canonicalById = new Map();
-    for (const model of models) {
-        canonicalById.set(model.id, model.canonical_slug || model.id);
-    }
-
     const entries = await mapLimit(modelIds, CONCURRENCY, async (modelId) => {
-        const permaslug = canonicalById.get(modelId) || modelId;
+        const model = models.find(item => item?.id === modelId);
+        const permaslug = model?.canonical_slug || modelId;
         const url = new URL(OPENROUTER_EFFECTIVE_PRICING_API);
         url.searchParams.set('permaslug', permaslug);
+        url.searchParams.set('range', '3m');
+        url.searchParams.set('shape', 'v7');
+        url.searchParams.set('variant', 'standard');
 
         try {
             const payload = await fetchJsonWithRetry(url.toString());
@@ -86,6 +85,7 @@ async function main() {
                 modelId,
                 permaslug,
                 resolved,
+                // Effective pricing is already reported per 1M tokens.
                 in: hasValidNumbers ? round6(weightedInputPrice) : null,
                 out: hasValidNumbers ? round6(weightedOutputPrice) : null,
                 providers: providerSummaries.length,

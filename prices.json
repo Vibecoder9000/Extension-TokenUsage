@@ -1,28 +1,76 @@
 {
-  "generatedAt": "2026-04-29T04:16:39.324Z",
-  "requestedModels": 369,
-  "resolvedModels": 328,
-  "unresolvedModels": 41,
+  "generatedAt": "2026-08-15T05:19:39.736Z",
+  "requestedModels": 412,
+  "resolvedModels": 383,
+  "unresolvedModels": 29,
   "unresolved": [
+    {
+      "modelId": "liquid/lfm-2.5-2.6b:free",
+      "permaslug": "liquid/lfm-2.5-2.6b-20260811",
+      "providers": 0,
+      "in": 0,
+      "out": 0,
+      "error": null
+    },
+    {
+      "modelId": "~deepseek/deepseek-v4-flash-latest",
+      "permaslug": "~deepseek/deepseek-v4-flash-latest",
+      "providers": 0,
+      "in": 0,
+      "out": 0,
+      "error": null
+    },
+    {
+      "modelId": "openrouter/auto-beta",
+      "permaslug": "openrouter/auto-beta",
+      "providers": 0,
+      "in": 0,
+      "out": 0,
+      "error": null
+    },
+    {
+      "modelId": "~x-ai/grok-latest",
+      "permaslug": "~x-ai/grok-latest",
+      "providers": 0,
+      "in": 0,
+      "out": 0,
+      "error": null
+    },
+    {
+      "modelId": "cohere/north-mini-code:free",
+      "permaslug": "cohere/north-mini-code-20260617",
+      "providers": 0,
+      "in": 0,
+      "out": 0,
+      "error": null
+    },
+    {
+      "modelId": "openrouter/fusion",
+      "permaslug": "openrouter/fusion",
+      "providers": 0,
+      "in": 0,
+      "out": 0,
+      "error": null
+    },
+    {
+      "modelId": "~anthropic/claude-fable-latest",
+      "permaslug": "~anthropic/claude-fable-latest",
+      "providers": 0,
+      "in": 0,
+      "out": 0,
+      "error": null
+    },
+    {
+      "modelId": "nvidia/nemotron-3.5-content-safety:free",
+      "permaslug": "nvidia/nemotron-3.5-content-safety-20260604",
+      "providers": 0,
+      "in": 0,
+      "out": 0,
+      "error": null
+    },
     {
       "modelId": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
       "permaslug": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning-20260428",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
-      "modelId": "poolside/laguna-xs.2:free",
-      "permaslug": "poolside/laguna-xs.2-20260421",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
-      "modelId": "poolside/laguna-m.1:free",
-      "permaslug": "poolside/laguna-m.1-20260312",
       "providers": 0,
       "in": 0,
       "out": 0,
@@ -85,22 +133,6 @@
       "error": null
     },
     {
-      "modelId": "inclusionai/ling-2.6-1t:free",
-      "permaslug": "inclusionai/ling-2.6-1t-20260423",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
-      "modelId": "tencent/hy3-preview:free",
-      "permaslug": "tencent/hy3-preview-20260421",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
       "modelId": "~anthropic/claude-opus-latest",
       "permaslug": "~anthropic/claude-opus-latest",
       "providers": 0,
@@ -117,32 +149,8 @@
       "error": null
     },
     {
-      "modelId": "baidu/qianfan-ocr-fast:free",
-      "permaslug": "baidu/qianfan-ocr-fast-20260420",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
       "modelId": "openrouter/free",
       "permaslug": "openrouter/free",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
-      "modelId": "liquid/lfm-2.5-1.2b-thinking:free",
-      "permaslug": "liquid/lfm-2.5-1.2b-thinking-20260120",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
-      "modelId": "liquid/lfm-2.5-1.2b-instruct:free",
-      "permaslug": "liquid/lfm-2.5-1.2b-instruct-20260120",
       "providers": 0,
       "in": 0,
       "out": 0,
@@ -165,40 +173,24 @@
       "error": null
     },
     {
-      "modelId": "baidu/ernie-4.5-21b-a3b-thinking",
-      "permaslug": "baidu/ernie-4.5-21b-a3b-thinking",
+      "modelId": "nvidia/nemotron-nano-12b-v2-vl:free",
+      "permaslug": "nvidia/nemotron-nano-12b-v2-vl",
       "providers": 0,
       "in": 0,
       "out": 0,
       "error": null
     },
     {
-      "modelId": "baidu/ernie-4.5-21b-a3b",
-      "permaslug": "baidu/ernie-4.5-21b-a3b",
+      "modelId": "openai/gpt-5-codex:batch",
+      "permaslug": "openai/gpt-5-codex",
       "providers": 0,
       "in": 0,
       "out": 0,
       "error": null
     },
     {
-      "modelId": "baidu/ernie-4.5-vl-28b-a3b",
-      "permaslug": "baidu/ernie-4.5-vl-28b-a3b",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
-      "modelId": "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
-      "permaslug": "venice/uncensored",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
-      "modelId": "google/gemma-3n-e2b-it:free",
-      "permaslug": "google/gemma-3n-e2b-it",
+      "modelId": "nvidia/nemotron-nano-9b-v2:free",
+      "permaslug": "nvidia/nemotron-nano-9b-v2",
       "providers": 0,
       "in": 0,
       "out": 0,
@@ -221,80 +213,8 @@
       "error": null
     },
     {
-      "modelId": "arcee-ai/spotlight",
-      "permaslug": "arcee-ai/spotlight",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
-      "modelId": "arcee-ai/maestro-reasoning",
-      "permaslug": "arcee-ai/maestro-reasoning",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
       "modelId": "arcee-ai/virtuoso-large",
       "permaslug": "arcee-ai/virtuoso-large",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
-      "modelId": "arcee-ai/coder-large",
-      "permaslug": "arcee-ai/coder-large",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
-      "modelId": "alfredpros/codellama-7b-instruct-solidity",
-      "permaslug": "alfredpros/codellama-7b-instruct-solidity",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
-      "modelId": "x-ai/grok-3-mini-beta",
-      "permaslug": "x-ai/grok-3-mini-beta",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
-      "modelId": "x-ai/grok-3-beta",
-      "permaslug": "x-ai/grok-3-beta",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
-      "modelId": "meta-llama/llama-guard-3-8b",
-      "permaslug": "meta-llama/llama-guard-3-8b",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
-      "modelId": "deepseek/deepseek-r1-distill-qwen-32b",
-      "permaslug": "deepseek/deepseek-r1-distill-qwen-32b",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
-      "modelId": "inflection/inflection-3-pi",
-      "permaslug": "inflection/inflection-3-pi",
       "providers": 0,
       "in": 0,
       "out": 0,
@@ -311,22 +231,6 @@
     {
       "modelId": "openrouter/auto",
       "permaslug": "openrouter/auto",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
-      "modelId": "openai/gpt-4-1106-preview",
-      "permaslug": "openai/gpt-4-1106-preview",
-      "providers": 0,
-      "in": 0,
-      "out": 0,
-      "error": null
-    },
-    {
-      "modelId": "openai/gpt-4-0314",
-      "permaslug": "openai/gpt-4-0314",
       "providers": 0,
       "in": 0,
       "out": 0,
