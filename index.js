@@ -14,6 +14,7 @@ import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 import { getGeneratingModel } from '../../../../script.js';
 import { pricing } from './dict.js';
+import { migrateUsageV1, deserializeUsage, serializeUsage, buildUsageCsv, createEmptyRuntime } from './storage.js';
 
 const extensionName = 'token-usage-tracker';
 
@@ -22,16 +23,16 @@ const defaultSettings = {
     modelColors: {}, // { "gpt-4o": "#6366f1", "claude-3-opus": "#8b5cf6", ... }
     // Prices per 1M tokens: { "gpt-4o": { in: 2.5, out: 10 }, ... }
     modelPrices: {},
-    // Accumulated usage data
+    // Accumulated usage data (persisted in compact v2 form via storage.js; byDay/byModel
+    // live only in the expanded runtime copy)
     usage: {
         session: { input: 0, output: 0, total: 0, messageCount: 0, startTime: null },
         allTime: { input: 0, output: 0, total: 0, messageCount: 0 },
-        // Time-based buckets: { "2025-01-15": { input: X, output: Y, total: Z, models: { "gpt-4o": 500, ... } }, ... }
-        byDay: {},
-        // Per-model usage: { "gpt-4o": { input: X, output: Y, total: Z, messageCount: N }, ... }
-        byModel: {},
     },
 };
+
+/** Expanded usage data rebuilt from the compact stored form on load */
+let usageRuntime = null;
 
 /**
  * Load extension settings, merging with defaults
@@ -41,43 +42,34 @@ function loadSettings() {
         extension_settings[extensionName] = structuredClone(defaultSettings);
     }
 
-    // Deep merge defaults for any missing keys
     const settings = extension_settings[extensionName];
     if (!settings.modelColors) settings.modelColors = {};
-    if (!settings.usage) settings.usage = structuredClone(defaultSettings.usage);
-    if (!settings.usage.session) settings.usage.session = structuredClone(defaultSettings.usage.session);
-    if (!settings.usage.allTime) settings.usage.allTime = structuredClone(defaultSettings.usage.allTime);
-    if (!settings.usage.byDay) settings.usage.byDay = {};
-    if (!settings.usage.byModel) settings.usage.byModel = {};
-
-    // Initialize modelPrices
     if (!settings.modelPrices) settings.modelPrices = {};
 
-    // Migration: Convert byDay.models from numeric format to object format
-    // Old: models[modelId] = totalTokens (number)
-    // New: models[modelId] = { input, output, total }
-    for (const dayData of Object.values(settings.usage.byDay)) {
-        if (dayData.models) {
-            for (const [modelId, value] of Object.entries(dayData.models)) {
-                if (typeof value === 'number') {
-                    // Migrate: estimate input/output using day's ratio
-                    const ratio = dayData.total ? value / dayData.total : 0;
-                    dayData.models[modelId] = {
-                        input: Math.round((dayData.input || 0) * ratio),
-                        output: Math.round((dayData.output || 0) * ratio),
-                        total: value,
-                    };
-                }
-            }
-        }
+    // Usage is stored in compact v2 form; migrate older layouts once, then expand
+    // into the runtime copy. Migration also drops the dead legacy buckets
+    // (byHour/byWeek/byMonth/byChat), which current code never writes or displays.
+    if (!settings.usage || settings.usage.v !== 2) {
+        settings.usage = migrateUsageV1(settings.usage || {});
+        console.log('[Token Usage Tracker] Migrated usage data to compact v2 storage format');
     }
+    usageRuntime = deserializeUsage(settings.usage);
 
     // Initialize session start time
-    if (!settings.usage.session.startTime) {
-        settings.usage.session.startTime = new Date().toISOString();
+    if (!usageRuntime.session.startTime) {
+        usageRuntime.session.startTime = new Date().toISOString();
     }
 
     return settings;
+}
+
+/**
+ * Write the compact form of the runtime usage data back into extension settings
+ */
+function persistUsage() {
+    const settings = getSettings();
+    settings.usage = serializeUsage(usageRuntime);
+    saveSettings();
 }
 
 /**
@@ -102,17 +94,6 @@ function getDayKey(date = new Date()) {
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');
     return `${year}-${month}-${day}`;
-}
-
-/**
- * Get the current hour key (YYYY-MM-DDTHH)
- */
-function getHourKey(date = new Date()) {
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    const day = String(date.getDate()).padStart(2, '0');
-    const hour = String(date.getHours()).padStart(2, '0');
-    return `${year}-${month}-${day}T${hour}`;
 }
 
 /**
@@ -165,8 +146,7 @@ async function countTokens(text) {
  * @param {{cost?: number|null, source?: string|null, hasTokenCounts?: boolean}} [apiUsage] - Optional API-reported usage metadata
  */
 function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, apiUsage = {}) {
-    const settings = getSettings();
-    const usage = settings.usage;
+    const usage = usageRuntime;
     const now = new Date();
     const totalTokens = inputTokens + outputTokens;
     const exactCost = Number.isFinite(apiUsage?.cost) ? apiUsage.cost : null;
@@ -218,7 +198,7 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, a
         addTokens(usage.byModel[modelId]);
     }
 
-    saveSettings();
+    persistUsage();
 
     // Emit custom event for UI updates
     eventSource.emit('tokenUsageUpdated', getUsageStats());
@@ -237,15 +217,14 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, a
  * Reset session usage
  */
 function resetSession() {
-    const settings = getSettings();
-    settings.usage.session = {
+    usageRuntime.session = {
         input: 0,
         output: 0,
         total: 0,
         messageCount: 0,
         startTime: new Date().toISOString(),
     };
-    saveSettings();
+    persistUsage();
     eventSource.emit('tokenUsageUpdated', getUsageStats());
     console.log('[Token Usage Tracker] Session reset');
 }
@@ -254,12 +233,28 @@ function resetSession() {
  * Reset all usage data
  */
 function resetAllUsage() {
-    const settings = getSettings();
-    settings.usage = structuredClone(defaultSettings.usage);
-    settings.usage.session.startTime = new Date().toISOString();
-    saveSettings();
+    usageRuntime = createEmptyRuntime();
+    usageRuntime.session.startTime = new Date().toISOString();
+    persistUsage();
     eventSource.emit('tokenUsageUpdated', getUsageStats());
     console.log('[Token Usage Tracker] All usage data reset');
+}
+
+/**
+ * Download the full usage history as CSV (one row per day x model)
+ */
+function exportUsageCsv() {
+    const csv = buildUsageCsv(usageRuntime, calculateStoredOrEstimatedCost);
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `token-usage-${getDayKey()}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toastr.success('Usage CSV downloaded');
 }
 
 /**
@@ -267,8 +262,7 @@ function resetAllUsage() {
  * @returns {Object} Usage statistics object
  */
 function getUsageStats() {
-    const settings = getSettings();
-    const usage = settings.usage;
+    const usage = usageRuntime;
     const now = new Date();
     const currentWeekKey = getWeekKey(now);
     const currentMonthKey = getMonthKey(now);
@@ -306,7 +300,6 @@ function getUsageStats() {
         session: { ...usage.session },
         allTime: { ...usage.allTime },
         today: usage.byDay[getDayKey(now)] || { input: 0, output: 0, total: 0, messageCount: 0, models: {} },
-        thisHour: usage.byHour?.[getHourKey(now)] || { input: 0, output: 0, total: 0, messageCount: 0 },
         thisWeek,
         thisMonth,
         currentChat: null, // Will be populated if context available
@@ -314,10 +307,6 @@ function getUsageStats() {
         tokenizer: tokenizerInfo.tokenizerName,
         // Raw data for advanced aggregation
         byDay: { ...usage.byDay },
-        byHour: { ...(usage.byHour || {}) },
-        byWeek: { ...(usage.byWeek || {}) },
-        byMonth: { ...(usage.byMonth || {}) },
-        byChat: { ...(usage.byChat || {}) },
         byModel: { ...usage.byModel },
     };
 }
@@ -329,8 +318,7 @@ function getUsageStats() {
  * @returns {Object} Aggregated usage for the range
  */
 function getUsageForRange(startDate, endDate) {
-    const settings = getSettings();
-    const usage = settings.usage;
+    const usage = usageRuntime;
 
     const result = { input: 0, output: 0, total: 0, messageCount: 0 };
 
@@ -372,12 +360,11 @@ function parseApiUsage(apiUsage) {
 
 /**
  * Get usage for a specific chat
- * @param {string} chatId - Chat ID
- * @returns {Object} Usage for the chat
+ * Per-chat tracking was removed with the v2 storage format; kept for API compatibility
+ * @returns {Object} Zeroed usage
  */
-function getChatUsage(chatId) {
-    const settings = getSettings();
-    return settings.usage.byChat?.[chatId] || { input: 0, output: 0, total: 0, messageCount: 0 };
+function getChatUsage() {
+    return { input: 0, output: 0, total: 0, messageCount: 0 };
 }
 
 
@@ -1373,8 +1360,7 @@ function formatCost(cost) {
     return `$${value.toFixed(2)}`;
 }
 
-function formatPricePerMillion(price) {
-    const value = Number(price);
+function formatPricePerMillion(price) {    const value = Number(price);
     if (!Number.isFinite(value) || value < 0) return null;
     if (value === 0) return '$0/1M';
     if (value >= 100) return `$${value.toFixed(0)}/1M`;
@@ -1417,8 +1403,7 @@ function renderUsageStatCard(title, prefix, data, cost = '$0.00') {
  * Calculate all-time cost using the byModel aggregation which has precise input/output counts
  */
 function calculateAllTimeCost() {
-    const settings = getSettings();
-    const byModel = settings.usage.byModel;
+    const byModel = usageRuntime.byModel;
     let total = 0;
 
     for (const [modelId, data] of Object.entries(byModel)) {
@@ -1857,8 +1842,7 @@ function updateUIStats() {
     let monthCost = 0;
     let todayCost = 0;
 
-    const settings = getSettings();
-    for (const [dayKey, data] of Object.entries(settings.usage.byDay)) {
+    for (const [dayKey, data] of Object.entries(usageRuntime.byDay)) {
         // Parse dayKey (YYYY-MM-DD) as local date, not UTC
         // new Date("2026-01-01") interprets as UTC, which shifts timezone
         const [year, month, day] = dayKey.split('-').map(Number);
@@ -2030,6 +2014,9 @@ function createSettingsUI() {
                     <div style="display: flex; align-items: center; gap: 8px; padding-left: 8px;">
                         <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.4;" id="token-usage-tokenizer">Tokenizer: ${stats.tokenizer || 'Unknown'}</div>
                         <div style="flex: 1;"></div>
+                        <div id="token-usage-export" class="menu_button" title="Download all usage data as CSV" style="color: var(--SmartThemeBodyColor); opacity: 0.8; font-size: 11px; white-space: nowrap;">
+                            <i class="fa-solid fa-download"></i>&nbsp;Export
+                        </div>
                         <div id="token-usage-reset-all" class="menu_button" title="Reset all stats" style="color: var(--SmartThemeBodyColor); opacity: 0.8; font-size: 11px; white-space: nowrap;">
                             <i class="fa-solid fa-trash"></i>&nbsp;Reset All
                         </div>
@@ -2071,6 +2058,8 @@ function createSettingsUI() {
             updateChartRange(parseInt(btn.getAttribute('data-value')));
         });
     });
+
+    $('#token-usage-export').on('click', exportUsageCsv);
 
     $('#token-usage-reset-all').on('click', function () {
         if (confirm('Are you sure you want to reset ALL token usage data? This cannot be undone.')) {
