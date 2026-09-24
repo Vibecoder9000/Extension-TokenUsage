@@ -2103,10 +2103,134 @@ function createSettingsUI() {
  * - ConnectionManagerRequestService.sendRequest (Used by extensions like Roadway)
  */
 let isTrackingBackground = false;
+/** Timestamp of the last time patchFetchForExtensionCalls recorded usage, used
+ *  by patchConnectionManager to know whether it needs to fall back to its own
+ *  (less accurate) manual counting. */
+let lastExtensionFetchRecordAt = 0;
 
 function patchBackgroundGenerations() {
     patchGenerateQuietPrompt();
     patchConnectionManager();
+    patchFetchForExtensionCalls();
+}
+
+/**
+ * Endpoints on the SillyTavern server itself that trigger an LLM generation.
+ * Extension code (generateRaw, custom fetch calls, third-party libs, etc.) has
+ * to route through one of these, since extensions don't hold your API keys.
+ * Add more path fragments here if a specific extension uses a different route
+ * (check the Network tab in devtools while it runs to find it).
+ */
+const GENERATION_ENDPOINTS = [
+    '/api/backends/chat-completions/generate',
+    '/api/backends/text-completions/generate',
+    '/api/novelai/generate',
+    '/api/openai/generate',
+];
+
+/**
+ * Patch window.fetch to catch generation requests that bypass both the main
+ * Generate() event flow AND ConnectionManagerRequestService.sendRequest -
+ * e.g. extensions calling generateRaw() (an ES export we can't monkey-patch
+ * directly) or extensions issuing their own fetch() to ST's backend routes.
+ *
+ * Only non-streaming (stream:false / stream:undefined) requests can be
+ * counted this way, since a streamed response body can't be read back out
+ * after the caller consumes it. Most one-off "background" extension calls
+ * (translation, summarization helpers, etc.) use non-streaming requests.
+ */
+function patchFetchForExtensionCalls() {
+    if (window.fetch._tokenUsageTrackerPatched) return;
+
+    const originalFetch = window.fetch.bind(window);
+
+    const patchedFetch = async function(input, init) {
+        const url = typeof input === 'string' ? input : (input?.url || '');
+        const isGenerationCall = GENERATION_ENDPOINTS.some(ep => url.includes(ep));
+
+        // Skip anything not aimed at a generation endpoint, or whenever the
+        // main chat flow (Generate()) is currently in flight, so we never
+        // double-count that exchange. ConnectionManagerRequestService calls
+        // (isTrackingBackground) are intentionally NOT skipped here - this is
+        // the most accurate place to record them, since the raw response
+        // carries the API's own usage numbers, not an estimate.
+        if (!isGenerationCall || pendingInputTokensPromise) {
+            return originalFetch(input, init);
+        }
+
+        let requestBody = null;
+        try {
+            const rawBody = typeof input !== 'string' && input?.body ? input.body : init?.body;
+            if (typeof rawBody === 'string') {
+                requestBody = JSON.parse(rawBody);
+            }
+        } catch (e) {
+            // Not JSON (or no body) - can't count input, but still let the call through
+        }
+
+        // A streaming request's response body can only be read once, and we
+        // don't reconstruct SSE chunks here, so don't try to intercept those.
+        if (requestBody?.stream) {
+            return originalFetch(input, init);
+        }
+
+        const response = await originalFetch(input, init);
+
+        try {
+            isTrackingBackground = true;
+
+            let inputTokens = 0;
+            if (requestBody) {
+                inputTokens = await countInputTokens({ prompt: requestBody.messages || requestBody.prompt });
+            }
+
+            // Clone so the extension that made the call still gets an unread body
+            const cloned = response.clone();
+            const contentType = cloned.headers.get('content-type') || '';
+            let outputTokens = 0;
+            let apiUsage = null;
+            let responseModel = null;
+
+            if (contentType.includes('application/json')) {
+                const json = await cloned.json().catch(() => null);
+                if (json) {
+                    responseModel = json.model || null;
+                    apiUsage = parseApiUsage(json.usage);
+                    const outputText = json.choices?.[0]?.message?.content
+                        ?? json.choices?.[0]?.text
+                        ?? json.results?.[0]?.text
+                        ?? json.content
+                        ?? json.text
+                        ?? '';
+                    if (typeof outputText === 'string' && outputText) {
+                        outputTokens = await countTokens(outputText);
+                    }
+                }
+            }
+
+            // The API's own echoed model (from the response) is the ground truth -
+            // it reflects whichever connection profile/model an extension actually
+            // used, which can differ from ST's main-UI active connection.
+            const modelId = responseModel || requestBody?.model || getGeneratingModel();
+
+            if (apiUsage) {
+                recordUsage(apiUsage.input, apiUsage.output, null, modelId, apiUsage);
+                lastExtensionFetchRecordAt = Date.now();
+            } else if (inputTokens > 0 || outputTokens > 0) {
+                recordUsage(inputTokens, outputTokens, null, modelId);
+                lastExtensionFetchRecordAt = Date.now();
+            }
+        } catch (e) {
+            console.error('[Token Usage Tracker] Error tracking extension fetch() call:', e);
+        } finally {
+            isTrackingBackground = false;
+        }
+
+        return response;
+    };
+
+    patchedFetch._tokenUsageTrackerPatched = true;
+    window.fetch = patchedFetch;
 }
 
 function patchGenerateQuietPrompt() {
@@ -2156,6 +2280,59 @@ async function flushQuietGeneration() {
     }
 }
 
+/**
+ * Look up the model configured on a specific Connection Manager profile,
+ * instead of assuming the currently-active/main connection profile is the
+ * one an extension's sendRequest() call actually used.
+ * @param {string} profileId
+ * @returns {string|null}
+ */
+function resolveProfileModel(profileId) {
+    if (!profileId) return null;
+    try {
+        const context = getContext();
+        // Field path has moved before between ST versions - try the known spots.
+        const profiles = context?.extensionSettings?.connectionManager?.profiles
+            || context?.extension_settings?.connectionManager?.profiles
+            || [];
+        // Match by id first (the documented identifier), but fall back to name
+        // in case the caller passed a profile name instead of its id.
+        const profile = profiles.find(p => p.id === profileId) || profiles.find(p => p.name === profileId);
+        return profile?.model || null;
+    } catch (e) {
+        console.error('[Token Usage Tracker] Error resolving connection profile model:', e);
+        return null;
+    }
+}
+
+/**
+ * Best-effort text extraction from a ConnectionManagerRequestService.sendRequest()
+ * result, for the fallback counting path. Handles both a plain string and the
+ * structured-output shape (e.g. { content: {...parsedJson}, reasoning: '...' })
+ * some extensions request.
+ * @param {*} result
+ * @returns {string}
+ */
+function extractTextFromSendRequestResult(result) {
+    if (!result) return '';
+    if (typeof result === 'string') return result;
+
+    const parts = [];
+    if (typeof result.content === 'string') {
+        parts.push(result.content);
+    } else if (result.content && typeof result.content === 'object') {
+        try {
+            parts.push(JSON.stringify(result.content));
+        } catch (e) {
+            // Circular or otherwise unstringifiable - skip it
+        }
+    }
+    if (typeof result.reasoning === 'string') {
+        parts.push(result.reasoning);
+    }
+    return parts.join('\n');
+}
+
 function patchConnectionManager() {
     // Poll for ConnectionManagerRequestService (used by Roadway and similar extensions)
     const checkInterval = setInterval(() => {
@@ -2176,33 +2353,40 @@ function patchConnectionManager() {
                     return await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
                 }
 
-                let inputTokens = 0;
-                const modelId = getGeneratingModel();
+                // Prefer the model actually configured on this profile/override, since
+                // getGeneratingModel() only reflects the main UI's active connection,
+                // which can differ from the profile the extension explicitly requested.
+                // (Used only as a fallback below - the fetch-level patch normally
+                // resolves this itself from the API's own response.)
+                const modelId = overridePayload?.model
+                    || custom?.model
+                    || resolveProfileModel(profileId)
+                    || getGeneratingModel();
+
+                const beforeRecordTs = lastExtensionFetchRecordAt;
 
                 try {
                     isTrackingBackground = true;
-
-                    try {
-                        inputTokens = await countInputTokens({ prompt: messages });
-                    } catch (e) {
-                        console.error('[Token Usage Tracker] Error counting sendRequest input:', e);
-                    }
-
                     const result = await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
 
-                    try {
-                        let outputTokens = 0;
-                        if (result && typeof result.content === 'string') {
-                            outputTokens = await countTokens(result.content);
-                        } else if (typeof result === 'string') {
-                            outputTokens = await countTokens(result);
-                        }
+                    // patchFetchForExtensionCalls sees the same network call this
+                    // sendRequest() triggers, and reads the API's own usage numbers
+                    // straight off the response - which is more accurate than
+                    // anything we can estimate from sendRequest's return value.
+                    // Only fall back to manual counting here if that didn't happen
+                    // (e.g. a non-JSON response, or an endpoint not in our list).
+                    if (lastExtensionFetchRecordAt === beforeRecordTs) {
+                        try {
+                            const inputTokens = await countInputTokens({ prompt: messages });
+                            const outputText = extractTextFromSendRequestResult(result);
+                            const outputTokens = outputText ? await countTokens(outputText) : 0;
 
-                        if (outputTokens > 0 || inputTokens > 0) {
-                            recordUsage(inputTokens, outputTokens, null, modelId);
+                            if (outputTokens > 0 || inputTokens > 0) {
+                                recordUsage(inputTokens, outputTokens, null, modelId);
+                            }
+                        } catch (e) {
+                            console.error('[Token Usage Tracker] Error in sendRequest fallback counting:', e);
                         }
-                    } catch (e) {
-                        console.error('[Token Usage Tracker] Error counting sendRequest output:', e);
                     }
 
                     return result;
