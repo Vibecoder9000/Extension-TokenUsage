@@ -1,12 +1,12 @@
 /* Token Usage Tracker Extension Styles */
 
-/* Active state for range buttons */
+/* Active state for range and view buttons */
+.token-usage-range-btn.active,
+.token-usage-view-btn.active,
 .range-btn.active {
-  background-color: white;
-  color: #0f172a; /* slate-900 */
-  box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.05),
-    0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  background-color: var(--SmartThemeBodyColor) !important;
+  color: var(--SmartThemeInputColor) !important;
+  font-weight: 600;
 }
 
 /* Transition for the hover cursor rect in the graph */
@@ -35,24 +35,14 @@
   position: relative;
 }
 
-.token-usage-range-controls {
-  position: absolute;
-  top: 12px;
-  left: 6px;
-  z-index: 2;
-}
-
-/* Adaptive layout for the week/month/all-time stat cards */
+/* Layout for the week/month/all-time stat cards */
 .token-usage-stats-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
 }
 
 .token-usage-stat-card {
   min-width: 0;
-}
-
-@media (max-width: 560px) {
-  .token-usage-stats-grid {
-    grid-template-columns: 1fr;
-  }
+  box-sizing: border-box;
 }

@@ -20,14 +20,21 @@ const extensionName = 'token-usage-tracker';
 
 const defaultSettings = {
     showInTopBar: true,
+    trackCache: true, // Whether to track and account for prompt cache
     modelColors: {}, // { "gpt-4o": "#6366f1", "claude-3-opus": "#8b5cf6", ... }
-    // Prices per 1M tokens: { "gpt-4o": { in: 2.5, out: 10 }, ... }
+    // Prices per 1M tokens: { "gpt-4o": { in: 2.5, out: 10, cache?: 0.25 }, ... }
     modelPrices: {},
+    // Cache simulation configuration
+    cacheSimulation: {
+        enabled: true,
+        minThreshold: 1024, // Min tokens to qualify for KV cache
+        ttlMinutes: 10,     // Cache TTL in minutes (0 = no expiration check)
+    },
     // Accumulated usage data (persisted in compact v2 form via storage.js; byDay/byModel
     // live only in the expanded runtime copy)
     usage: {
-        session: { input: 0, output: 0, total: 0, messageCount: 0, startTime: null },
-        allTime: { input: 0, output: 0, total: 0, messageCount: 0 },
+        session: { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0, startTime: null },
+        allTime: { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0 },
     },
 };
 
@@ -43,8 +50,14 @@ function loadSettings() {
     }
 
     const settings = extension_settings[extensionName];
+    if (settings.trackCache === undefined) {
+        settings.trackCache = true;
+    }
     if (!settings.modelColors) settings.modelColors = {};
     if (!settings.modelPrices) settings.modelPrices = {};
+    if (!settings.cacheSimulation) {
+        settings.cacheSimulation = structuredClone(defaultSettings.cacheSimulation);
+    }
 
     // Usage is stored in compact v2 form; migrate older layouts once, then expand
     // into the runtime copy. Migration also drops the dead legacy buckets
@@ -144,15 +157,18 @@ async function countTokens(text) {
  * @param {string} [chatId] - Optional chat ID for per-chat tracking
  * @param {string} [modelId] - Optional model ID for per-model tracking
  * @param {{cost?: number|null, source?: string|null, hasTokenCounts?: boolean}} [apiUsage] - Optional API-reported usage metadata
+ * @param {number} [cacheReadTokens=0] - Tokens served from prompt cache
  */
-function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, apiUsage = {}) {
+function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, apiUsage = {}, cacheReadTokens = 0) {
     const usage = usageRuntime;
     const now = new Date();
-    const totalTokens = inputTokens + outputTokens;
+    const cr = Math.max(0, cacheReadTokens || 0);
+    const totalTokens = inputTokens + outputTokens + cr;
     const exactCost = Number.isFinite(apiUsage?.cost) ? apiUsage.cost : null;
 
     const addTokens = (bucket) => {
         bucket.input = (bucket.input || 0) + inputTokens;
+        bucket.cache_read = (bucket.cache_read || 0) + cr;
         bucket.output = (bucket.output || 0) + outputTokens;
         bucket.total = (bucket.total || 0) + totalTokens;
         bucket.messageCount = (bucket.messageCount || 0) + 1;
@@ -171,17 +187,18 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, a
 
     // By day
     const dayKey = getDayKey(now);
-    if (!usage.byDay[dayKey]) usage.byDay[dayKey] = { input: 0, output: 0, total: 0, messageCount: 0, models: {} };
+    if (!usage.byDay[dayKey]) usage.byDay[dayKey] = { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0, models: {} };
     addTokens(usage.byDay[dayKey]);
 
     // Track model within day for stacked chart (with input/output breakdown for cost calculation)
     if (modelId) {
         if (!usage.byDay[dayKey].models) usage.byDay[dayKey].models = {};
         if (!usage.byDay[dayKey].models[modelId]) {
-            usage.byDay[dayKey].models[modelId] = { input: 0, output: 0, total: 0, messageCount: 0 };
+            usage.byDay[dayKey].models[modelId] = { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0 };
         }
         const modelData = usage.byDay[dayKey].models[modelId];
         modelData.input += inputTokens;
+        modelData.cache_read = (modelData.cache_read || 0) + cr;
         modelData.output += outputTokens;
         modelData.total += totalTokens;
         modelData.messageCount = (modelData.messageCount || 0) + 1;
@@ -194,7 +211,7 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, a
 
     // By model (aggregate)
     if (modelId) {
-        if (!usage.byModel[modelId]) usage.byModel[modelId] = { input: 0, output: 0, total: 0, messageCount: 0 };
+        if (!usage.byModel[modelId]) usage.byModel[modelId] = { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0 };
         addTokens(usage.byModel[modelId]);
     }
 
@@ -203,14 +220,14 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, a
     // Emit custom event for UI updates
     eventSource.emit('tokenUsageUpdated', getUsageStats());
 
-    const estimatedCost = exactCost === null ? calculateCost(inputTokens, outputTokens, modelId) : 0;
+    const estimatedCost = exactCost === null ? calculateCost(inputTokens, outputTokens, modelId, cr) : 0;
     const costLog = exactCost !== null
         ? `, cost: $${exactCost.toFixed(6)} (reported by API)`
         : estimatedCost > 0
             ? `, cost: $${estimatedCost.toFixed(6)} (model pricing)`
             : '';
     const countSource = apiUsage?.hasTokenCounts ? 'reported by API' : `counted with ${getFriendlyTokenizerName(main_api).tokenizerName}`;
-    console.log(`[Token Usage Tracker] Recorded: +${inputTokens} input, +${outputTokens} output, model: ${modelId || 'unknown'}${costLog} (${countSource})`);
+    console.log(`[Token Usage Tracker] Recorded: +${inputTokens} input, +${cr} cache_read, +${outputTokens} output, model: ${modelId || 'unknown'}${costLog} (${countSource})`);
 }
 
 /**
@@ -244,7 +261,8 @@ function resetAllUsage() {
  * Download the full usage history as CSV (one row per day x model)
  */
 function exportUsageCsv() {
-    const csv = buildUsageCsv(usageRuntime, calculateStoredOrEstimatedCost);
+    const isCacheActive = getSettings().trackCache !== false;
+    const csv = buildUsageCsv(usageRuntime, calculateStoredOrEstimatedCost, isCacheActive);
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -266,8 +284,8 @@ function getUsageStats() {
     const now = new Date();
     const currentWeekKey = getWeekKey(now);
     const currentMonthKey = getMonthKey(now);
-    const thisWeek = { input: 0, output: 0, total: 0, messageCount: 0 };
-    const thisMonth = { input: 0, output: 0, total: 0, messageCount: 0 };
+    const thisWeek = { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0 };
+    const thisMonth = { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0 };
 
     // Get current tokenizer info for display
     let tokenizerInfo = { tokenizerName: 'Unknown' };
@@ -283,6 +301,7 @@ function getUsageStats() {
 
         if (getWeekKey(date) === currentWeekKey) {
             thisWeek.input += data.input || 0;
+            thisWeek.cache_read += data.cache_read || 0;
             thisWeek.output += data.output || 0;
             thisWeek.total += data.total || 0;
             thisWeek.messageCount += data.messageCount || 0;
@@ -290,6 +309,7 @@ function getUsageStats() {
 
         if (getMonthKey(date) === currentMonthKey) {
             thisMonth.input += data.input || 0;
+            thisMonth.cache_read += data.cache_read || 0;
             thisMonth.output += data.output || 0;
             thisMonth.total += data.total || 0;
             thisMonth.messageCount += data.messageCount || 0;
@@ -299,7 +319,7 @@ function getUsageStats() {
     return {
         session: { ...usage.session },
         allTime: { ...usage.allTime },
-        today: usage.byDay[getDayKey(now)] || { input: 0, output: 0, total: 0, messageCount: 0, models: {} },
+        today: usage.byDay[getDayKey(now)] || { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0, models: {} },
         thisWeek,
         thisMonth,
         currentChat: null, // Will be populated if context available
@@ -320,11 +340,12 @@ function getUsageStats() {
 function getUsageForRange(startDate, endDate) {
     const usage = usageRuntime;
 
-    const result = { input: 0, output: 0, total: 0, messageCount: 0 };
+    const result = { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0 };
 
     for (const [day, data] of Object.entries(usage.byDay)) {
         if (day >= startDate && day <= endDate) {
             result.input += data.input || 0;
+            result.cache_read += data.cache_read || 0;
             result.output += data.output || 0;
             result.total += data.total || 0;
             result.messageCount += data.messageCount || 0;
@@ -335,27 +356,77 @@ function getUsageForRange(startDate, endDate) {
 }
 
 /**
- * Parses the OpenAI-compatible usage shape returned by Meta Model API.
+ * Parses the OpenAI/Anthropic-compatible usage shape returned by API.
+ * Extracts native cached token counts if present.
  * @param {any} apiUsage
- * @returns {{input: number, output: number, total: number, cost: number|null, source: string, hasTokenCounts: true}|null}
+ * @returns {{input: number, cache_read: number, output: number, total: number, rawPromptTokens: number, cost: number|null, source: string, hasTokenCounts: true, hasCacheTokens: boolean}|null}
  */
 function parseApiUsage(apiUsage) {
     if (!apiUsage || typeof apiUsage !== 'object') return null;
 
-    const input = apiUsage.prompt_tokens;
-    const output = apiUsage.completion_tokens;
-    const total = apiUsage.total_tokens;
+    let input = apiUsage.prompt_tokens;
+    let output = apiUsage.completion_tokens;
+    let total = apiUsage.total_tokens;
+
+    // Check for Anthropic style tokens (input_tokens, output_tokens)
+    if (input === undefined && typeof apiUsage.input_tokens === 'number') {
+        input = apiUsage.input_tokens;
+    }
+    if (output === undefined && typeof apiUsage.output_tokens === 'number') {
+        output = apiUsage.output_tokens;
+    }
+
     if (typeof input !== 'number' || !Number.isFinite(input) || input < 0
-        || typeof output !== 'number' || !Number.isFinite(output) || output < 0
-        || typeof total !== 'number' || !Number.isFinite(total) || total < 0) {
+        || typeof output !== 'number' || !Number.isFinite(output) || output < 0) {
         return null;
+    }
+
+    // Check for native prompt cache tokens from various providers:
+    // 1. OpenAI / One-API: prompt_tokens_details.cached_tokens or cached_tokens
+    // 2. Anthropic: cache_read_input_tokens
+    // 3. DeepSeek: prompt_cache_hit_tokens
+    // 4. Gemini: cached_content_token_count
+    let cache_read = 0;
+    if (typeof apiUsage.prompt_tokens_details?.cached_tokens === 'number') {
+        cache_read = apiUsage.prompt_tokens_details.cached_tokens;
+    } else if (typeof apiUsage.cached_tokens === 'number') {
+        cache_read = apiUsage.cached_tokens;
+    } else if (typeof apiUsage.cache_read_input_tokens === 'number') {
+        cache_read = apiUsage.cache_read_input_tokens;
+    } else if (typeof apiUsage.prompt_cache_hit_tokens === 'number') {
+        cache_read = apiUsage.prompt_cache_hit_tokens;
+    } else if (typeof apiUsage.cached_content_token_count === 'number') {
+        cache_read = apiUsage.cached_content_token_count;
+    }
+
+    // In OpenAI/DeepSeek/Gemini, prompt_tokens includes cached_tokens.
+    // Anthropic input_tokens does NOT include cache_read_input_tokens.
+    const isAnthropicStyle = typeof apiUsage.input_tokens === 'number' && typeof apiUsage.cache_read_input_tokens === 'number';
+    const totalPrompt = isAnthropicStyle ? (input + cache_read) : input;
+    let netInput = input;
+    if (!isAnthropicStyle && cache_read > 0) {
+        netInput = Math.max(0, input - cache_read);
+    }
+
+    if (typeof total !== 'number' || !Number.isFinite(total)) {
+        total = netInput + cache_read + output;
     }
 
     const rawCost = apiUsage.cost ?? apiUsage.cost_details?.upstream_inference_cost;
     const parsedCost = rawCost === null || rawCost === undefined || rawCost === '' ? null : Number(rawCost);
     const cost = Number.isFinite(parsedCost) && parsedCost >= 0 ? parsedCost : null;
 
-    return { input, output, total, cost, source: 'api_usage', hasTokenCounts: true };
+    return {
+        input: netInput,
+        cache_read,
+        output,
+        total,
+        rawPromptTokens: totalPrompt,
+        cost,
+        source: 'api_usage',
+        hasTokenCounts: true,
+        hasCacheTokens: cache_read > 0,
+    };
 }
 
 /**
@@ -364,13 +435,133 @@ function parseApiUsage(apiUsage) {
  * @returns {Object} Zeroed usage
  */
 function getChatUsage() {
-    return { input: 0, output: 0, total: 0, messageCount: 0 };
+    return { input: 0, output: 0, cache_read: 0, total: 0, messageCount: 0 };
 }
 
+/** Cache state per chat to track KV cache prefix: chatId -> { prompt: Array|string, timestamp: number } */
+const chatPromptCache = new Map();
+
+/**
+ * Compare two messages for prompt cache prefix matching
+ */
+function isMessageEqual(m1, m2) {
+    if (!m1 || !m2) return false;
+    if (m1.role !== m2.role) return false;
+    if (typeof m1.content === 'string' && typeof m2.content === 'string') {
+        return m1.content === m2.content;
+    }
+    try {
+        return JSON.stringify(m1.content) === JSON.stringify(m2.content);
+    } catch (e) {
+        return false;
+    }
+}
+
+/**
+ * Calculate token count for a single message object
+ */
+async function countMessageTokens(message) {
+    if (!message) return 0;
+    let tokens = 0;
+    if (message.content) {
+        if (typeof message.content === 'string') {
+            tokens += await countTokens(message.content);
+        } else if (Array.isArray(message.content)) {
+            for (const part of message.content) {
+                if (part.type === 'text' && part.text) {
+                    tokens += await countTokens(part.text);
+                } else if (part.type === 'image_url' || part.type === 'image') {
+                    tokens += 765;
+                }
+            }
+        }
+    }
+    if (message.role) tokens += 1;
+    if (message.name) tokens += await countTokens(message.name);
+    if (Array.isArray(message.tool_calls)) {
+        for (const tc of message.tool_calls) {
+            if (tc.function?.name) tokens += await countTokens(tc.function.name);
+            if (tc.function?.arguments) tokens += await countTokens(tc.function.arguments);
+        }
+    }
+    tokens += 3; // per-message envelope overhead
+    return tokens;
+}
+
+/**
+ * Infer cache tokens from previous prompt for this chat.
+ * @param {object} generate_data - generation data containing the full prompt
+ * @param {string} chatId - chat ID or identifier
+ * @returns {Promise<number>} - simulated cached tokens
+ */
+async function inferPromptCacheTokens(generate_data, chatId) {
+    const settings = getSettings();
+    if (settings.trackCache === false) return 0;
+    const simCfg = settings.cacheSimulation || {};
+    if (simCfg.enabled === false) return 0;
+
+    const minThreshold = simCfg.minThreshold ?? 1024;
+    const ttlMinutes = simCfg.ttlMinutes ?? 10;
+    const ttlMs = ttlMinutes > 0 ? ttlMinutes * 60 * 1000 : 0;
+
+    const lastState = chatPromptCache.get(chatId);
+    if (!lastState || !lastState.prompt) return 0;
+
+    if (ttlMs > 0 && (Date.now() - lastState.timestamp) > ttlMs) {
+        console.log(`[Token Usage Tracker] Cache simulation: TTL expired (${Math.round((Date.now() - lastState.timestamp) / 60000)}m > ${ttlMinutes}m)`);
+        return 0;
+    }
+
+    const currentPrompt = generate_data.prompt;
+    const lastPrompt = lastState.prompt;
+    let simulatedCacheTokens = 0;
+
+    if (Array.isArray(currentPrompt) && Array.isArray(lastPrompt)) {
+        let matchingCount = 0;
+        const maxLen = Math.min(currentPrompt.length, lastPrompt.length);
+        for (let i = 0; i < maxLen; i++) {
+            if (isMessageEqual(currentPrompt[i], lastPrompt[i])) {
+                matchingCount++;
+            } else {
+                break;
+            }
+        }
+
+        if (matchingCount > 0) {
+            for (let i = 0; i < matchingCount; i++) {
+                simulatedCacheTokens += await countMessageTokens(currentPrompt[i]);
+            }
+            console.log(`[Token Usage Tracker] Cache simulation: matched ${matchingCount}/${currentPrompt.length} messages (${simulatedCacheTokens} tokens)`);
+        }
+    } else if (typeof currentPrompt === 'string' && typeof lastPrompt === 'string') {
+        let commonLen = 0;
+        const maxLen = Math.min(currentPrompt.length, lastPrompt.length);
+        while (commonLen < maxLen && currentPrompt.charCodeAt(commonLen) === lastPrompt.charCodeAt(commonLen)) {
+            commonLen++;
+        }
+        if (commonLen > 0) {
+            const prefixStr = currentPrompt.slice(0, commonLen);
+            simulatedCacheTokens = await countTokens(prefixStr);
+            console.log(`[Token Usage Tracker] Cache simulation: matched prefix string (${simulatedCacheTokens} tokens)`);
+        }
+    }
+
+    if (simulatedCacheTokens < minThreshold) {
+        if (simulatedCacheTokens > 0) {
+            console.log(`[Token Usage Tracker] Cache simulation: ${simulatedCacheTokens} tokens below minThreshold (${minThreshold}), treated as 0`);
+        }
+        return 0;
+    }
+
+    return simulatedCacheTokens;
+}
 
 /** @type {Promise<number>|null} Promise that resolves to input token count - started early, awaited later */
 let pendingInputTokensPromise = null;
+let pendingSimulatedCachePromise = null;
 let pendingModelId = null;
+let pendingChatId = null;
+let pendingGeneratePrompt = null;
 // For 'continue' type generations, track the pre-continue token count so we can compute the delta
 let preContinueTokenCount = 0;
 
@@ -471,6 +662,10 @@ function handleGenerateAfterData(generate_data, dryRun) {
     // Capture model ID synchronously (fast)
     pendingModelId = getGeneratingModel();
 
+    const context = getContext();
+    pendingChatId = context.chatMetadata?.chat_id || (context.characterId !== undefined ? String(context.characterId) : 'default');
+    pendingGeneratePrompt = generate_data.prompt;
+
     // Start token counting but DON'T await - let it run in parallel with the API request
     pendingInputTokensPromise = countInputTokens(generate_data)
         .then(count => {
@@ -479,6 +674,13 @@ function handleGenerateAfterData(generate_data, dryRun) {
         })
         .catch(error => {
             console.error('[Token Usage Tracker] Error counting input tokens:', error);
+            return 0;
+        });
+
+    // Start cache simulation in parallel
+    pendingSimulatedCachePromise = inferPromptCacheTokens(generate_data, pendingChatId)
+        .catch(error => {
+            console.error('[Token Usage Tracker] Error inferring cache tokens:', error);
             return 0;
         });
 }
@@ -563,11 +765,31 @@ async function handleMessageReceived(messageIndex, type) {
         const apiUsage = parseApiUsage(message.extra?.api_usage);
         let inputTokens;
         let outputTokens;
+        let cacheReadTokens = 0;
+
+        const settings = getSettings();
+        const isCacheTracked = settings.trackCache !== false;
+        const simulatedCacheTokens = (isCacheTracked && pendingSimulatedCachePromise) ? (await pendingSimulatedCachePromise) : 0;
 
         if (apiUsage) {
-            inputTokens = apiUsage.input;
             outputTokens = apiUsage.output;
-            console.log(`[Token Usage Tracker] Using API-reported usage: ${inputTokens} in, ${outputTokens} out${apiUsage.cost !== null ? `, $${apiUsage.cost.toFixed(6)}` : ''}`);
+            if (!isCacheTracked) {
+                // When cache tracking is disabled, all prompt tokens count as input
+                cacheReadTokens = 0;
+                inputTokens = apiUsage.rawPromptTokens ?? (apiUsage.input + (apiUsage.cache_read || 0));
+                console.log(`[Token Usage Tracker] Cache tracking disabled. Using full prompt tokens: ${inputTokens} in, ${outputTokens} out`);
+            } else if (apiUsage.hasCacheTokens) {
+                // API returned native cache tokens
+                cacheReadTokens = apiUsage.cache_read;
+                inputTokens = apiUsage.input;
+                console.log(`[Token Usage Tracker] Using API-reported usage: ${inputTokens} in, ${cacheReadTokens} cache_read, ${outputTokens} out${apiUsage.cost !== null ? `, $${apiUsage.cost.toFixed(6)}` : ''}`);
+            } else {
+                // API reported usage without cache breakdown (e.g. proxy site omitting cached_tokens)
+                const rawPrompt = apiUsage.rawPromptTokens ?? apiUsage.input;
+                cacheReadTokens = Math.min(simulatedCacheTokens, rawPrompt);
+                inputTokens = Math.max(0, rawPrompt - cacheReadTokens);
+                console.log(`[Token Usage Tracker] Using API-reported tokens with simulated cache: ${inputTokens} net in, ${cacheReadTokens} cache_read (from ${rawPrompt} prompt tokens), ${outputTokens} out`);
+            }
         } else {
             // Use SillyTavern's pre-calculated token count if available.
             // This already includes reasoning tokens when power_user.message_token_count_enabled is true.
@@ -586,6 +808,17 @@ async function handleMessageReceived(messageIndex, type) {
                 }
                 console.log(`[Token Usage Tracker] Manually counted tokens: ${outputTokens}`);
             }
+
+            const totalIn = await pendingInputTokensPromise;
+            if (!isCacheTracked) {
+                cacheReadTokens = 0;
+                inputTokens = totalIn;
+                console.log(`[Token Usage Tracker] Cache tracking disabled. Using full local tokens: ${inputTokens} in, ${outputTokens} out`);
+            } else {
+                cacheReadTokens = Math.min(simulatedCacheTokens, totalIn);
+                inputTokens = Math.max(0, totalIn - cacheReadTokens);
+                console.log(`[Token Usage Tracker] Using local tokenizer with simulated cache: ${inputTokens} net in, ${cacheReadTokens} cache_read (from ${totalIn} total in), ${outputTokens} out`);
+            }
         }
 
         // For local-tokenizer continue records, subtract the pre-continue count.
@@ -600,23 +833,39 @@ async function handleMessageReceived(messageIndex, type) {
         const savedPreContinueCount = preContinueTokenCount;
         preContinueTokenCount = 0;
 
-        // Await the fallback input token count only when the API did not report it.
-        if (inputTokens === undefined) {
-            inputTokens = await pendingInputTokensPromise;
-        } else {
-            // Drain the pending promise so any tokenizer error handling has completed.
-            pendingInputTokensPromise.catch(() => {});
-        }
+        // Drain pending promises so any tokenizer error handling has completed.
+        if (pendingInputTokensPromise) pendingInputTokensPromise.catch(() => {});
+        if (pendingSimulatedCachePromise) pendingSimulatedCachePromise.catch(() => {});
+
         const modelId = pendingModelId;
+        const currentChatId = pendingChatId || context.chatMetadata?.chat_id || (context.characterId !== undefined ? String(context.characterId) : null);
+
+        // Update chatPromptCache for next turn
+        if (currentChatId && pendingGeneratePrompt) {
+            let nextCachedPrompt;
+            if (Array.isArray(pendingGeneratePrompt)) {
+                nextCachedPrompt = [
+                    ...pendingGeneratePrompt,
+                    { role: 'assistant', content: message.mes || '' },
+                ];
+            } else if (typeof pendingGeneratePrompt === 'string') {
+                nextCachedPrompt = pendingGeneratePrompt + '\n' + (message.mes || '');
+            }
+            chatPromptCache.set(currentChatId, {
+                prompt: nextCachedPrompt,
+                timestamp: Date.now(),
+            });
+        }
+
         pendingInputTokensPromise = null;
+        pendingSimulatedCachePromise = null;
         pendingModelId = null;
+        pendingChatId = null;
+        pendingGeneratePrompt = null;
 
-        // Get current chat ID if available
-        const chatId = context.chatMetadata?.chat_id || null;
+        recordUsage(inputTokens, outputTokens, currentChatId, modelId, apiUsage, cacheReadTokens);
 
-        recordUsage(inputTokens, outputTokens, chatId, modelId, apiUsage);
-
-        console.log(`[Token Usage Tracker] Recorded exchange: ${inputTokens} in, ${outputTokens} out, model: ${modelId || 'unknown'}${savedPreContinueCount > 0 ? ' (continue delta)' : ''}`);
+        console.log(`[Token Usage Tracker] Recorded exchange: ${inputTokens} in, ${cacheReadTokens} cache_read, ${outputTokens} out, model: ${modelId || 'unknown'}${savedPreContinueCount > 0 ? ' (continue delta)' : ''}`);
     } catch (error) {
         console.error('[Token Usage Tracker] Error counting output tokens:', error);
     }
@@ -652,23 +901,33 @@ async function handleGenerationStopped() {
 
         // Await the input token counting that was started in handleGenerateAfterData
         const inputTokens = await pendingInputTokensPromise;
+        const settings = getSettings();
+        const isCacheTracked = settings.trackCache !== false;
+        const simulatedCacheTokens = (isCacheTracked && pendingSimulatedCachePromise) ? (await pendingSimulatedCachePromise) : 0;
+        const cacheReadTokens = isCacheTracked ? Math.min(simulatedCacheTokens, inputTokens) : 0;
+        const netInput = isCacheTracked ? Math.max(0, inputTokens - cacheReadTokens) : inputTokens;
         const modelId = pendingModelId;
+        const currentChatId = pendingChatId || null;
+
         pendingInputTokensPromise = null;
+        pendingSimulatedCachePromise = null;
         pendingModelId = null;
+        pendingChatId = null;
+        pendingGeneratePrompt = null;
         preContinueTokenCount = 0; // Reset continue state too
 
-        // Get current chat ID if available
-        const context = getContext();
-        const chatId = context.chatMetadata?.chat_id || null;
-
         // Record the usage - input tokens were sent even if generation was stopped
-        recordUsage(inputTokens, outputTokens, chatId, modelId);
+        recordUsage(netInput, outputTokens, currentChatId, modelId, {}, cacheReadTokens);
 
-        console.log(`[Token Usage Tracker] Recorded stopped generation: ${inputTokens} in, ${outputTokens} out (partial), model: ${modelId || 'unknown'}`);
+        console.log(`[Token Usage Tracker] Recorded stopped generation: ${netInput} in, ${cacheReadTokens} cache_read, ${outputTokens} out (partial), model: ${modelId || 'unknown'}`);
     } catch (error) {
         console.error('[Token Usage Tracker] Error handling stopped generation:', error);
         // Reset pending tokens even on error to prevent double counting
         pendingInputTokensPromise = null;
+        pendingSimulatedCachePromise = null;
+        pendingModelId = null;
+        pendingChatId = null;
+        pendingGeneratePrompt = null;
         preContinueTokenCount = 0;
     }
 }
@@ -679,12 +938,14 @@ async function handleGenerationStopped() {
 function handleChatChanged(chatId) {
     // Reset pending tokens when chat changes to prevent cross-chat counting
     pendingInputTokensPromise = null;
+    pendingSimulatedCachePromise = null;
     pendingModelId = null;
+    pendingChatId = null;
+    pendingGeneratePrompt = null;
     preContinueTokenCount = 0;
     isQuietGeneration = false;
     isImpersonateGeneration = false;
     console.log(`[Token Usage Tracker] Chat changed to: ${chatId}`);
-    eventSource.emit('tokenUsageUpdated', getUsageStats());
 }
 
 /**
@@ -796,8 +1057,35 @@ function formatTokens(count) {
  * Format number with commas
  */
 function formatNumberFull(num) {
+    if (typeof num !== 'number' || !Number.isFinite(num)) return '0';
     return new Intl.NumberFormat('en-US').format(num);
 }
+
+/**
+ * Adaptive formatting for dense card columns (k/M compact notation)
+ */
+function formatNumberAdaptive(num) {
+    if (typeof num !== 'number' || !Number.isFinite(num)) return '0';
+    const isNeg = num < 0;
+    const abs = Math.abs(num);
+    let str = '0';
+    if (abs === 0) {
+        str = '0';
+    } else if (abs < 1000) {
+        str = abs.toString();
+    } else if (abs < 10000) {
+        str = abs.toLocaleString('en-US');
+    } else if (abs < 1000000) {
+        const k = abs / 1000;
+        str = (k >= 100 ? k.toFixed(0) : k.toFixed(1)) + 'k';
+    } else if (abs < 10000000) {
+        str = (abs / 1000000).toFixed(2) + 'M';
+    } else {
+        str = (abs / 1000000).toFixed(1) + 'M';
+    }
+    return isNeg ? '-' + str : str;
+}
+
 
 /**
  * Normalize model IDs for compatibility matching.
@@ -1131,7 +1419,10 @@ function parsePriceObject(price) {
     if (!Number.isFinite(input) || !Number.isFinite(output) || input < 0 || output < 0) {
         return null;
     }
-    return { in: input, out: output };
+    const cache = price.cache != null && Number.isFinite(Number.parseFloat(price.cache)) && Number.parseFloat(price.cache) >= 0
+        ? Number.parseFloat(price.cache)
+        : null;
+    return { in: input, out: output, cache: cache };
 }
 
 /**
@@ -1310,18 +1601,28 @@ function getModelPrice(modelId) {
  * @param {string} modelId
  * @param {number} priceIn - Price per 1M input tokens
  * @param {number} priceOut - Price per 1M output tokens
+ * @param {number|null} [priceCache=null] - Price per 1M cached tokens (optional)
  */
-function setModelPrice(modelId, priceIn, priceOut) {
+function setModelPrice(modelId, priceIn, priceOut, priceCache = null) {
     const settings = getSettings();
     const normalizePrice = (value) => {
+        if (value === null || value === undefined || value === '') return null;
         const parsed = Number.parseFloat(value);
-        if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+        if (!Number.isFinite(parsed) || parsed < 0) return null;
         return parsed < 0.001 ? 0.001 : parsed;
     };
-    settings.modelPrices[modelId] = {
-        in: normalizePrice(priceIn),
-        out: normalizePrice(priceOut),
+    const normIn = normalizePrice(priceIn);
+    const normOut = normalizePrice(priceOut);
+    const normCache = normalizePrice(priceCache);
+
+    const priceObj = {
+        in: normIn !== null ? normIn : 0,
+        out: normOut !== null ? normOut : 0,
     };
+    if (normCache !== null) {
+        priceObj.cache = normCache;
+    }
+    settings.modelPrices[modelId] = priceObj;
     manualNormalizedPriceLookupMap = null;
     manualPriceProfiles = null;
     saveSettings();
@@ -1332,17 +1633,30 @@ function setModelPrice(modelId, priceIn, priceOut) {
  * @param {number} inputTokens
  * @param {number} outputTokens
  * @param {string} modelId
+ * @param {number} cacheReadTokens
  * @returns {number} Cost in dollars
  */
-function calculateCost(inputTokens, outputTokens, modelId) {
-    if ((inputTokens || 0) <= 0 && (outputTokens || 0) <= 0) return 0;
+function calculateCost(inputTokens, outputTokens, modelId, cacheReadTokens = 0) {
+    const settings = getSettings();
+    const isCacheTracked = settings.trackCache !== false;
+
+    // If cache tracking is disabled, fold cache tokens into regular input tokens
+    const effectiveInput = isCacheTracked ? (inputTokens || 0) : ((inputTokens || 0) + (cacheReadTokens || 0));
+    const effectiveCache = isCacheTracked ? (cacheReadTokens || 0) : 0;
+    const effectiveOutput = outputTokens || 0;
+
+    if (effectiveInput <= 0 && effectiveOutput <= 0 && effectiveCache <= 0) return 0;
 
     const prices = resolveModelPrice(modelId);
     if (!prices.resolved || prices.in === null || prices.out === null) return 0;
 
-    const inputCost = (inputTokens / 1000000) * prices.in;
-    const outputCost = (outputTokens / 1000000) * prices.out;
-    return inputCost + outputCost;
+    // Cache price: default to 10% of input price if not specified
+    const cachePrice = prices.cache != null ? prices.cache : (prices.in * 0.1);
+
+    const inputCost = (effectiveInput / 1000000) * prices.in;
+    const cacheCost = (effectiveCache / 1000000) * cachePrice;
+    const outputCost = (effectiveOutput / 1000000) * prices.out;
+    return inputCost + cacheCost + outputCost;
 }
 
 function calculateStoredOrEstimatedCost(data, modelId) {
@@ -1351,7 +1665,8 @@ function calculateStoredOrEstimatedCost(data, modelId) {
     const exactCost = Number.isFinite(data.cost) ? data.cost : 0;
     const residualInput = Math.max(0, (data.input || 0) - (data.costedInput || 0));
     const residualOutput = Math.max(0, (data.output || 0) - (data.costedOutput || 0));
-    return exactCost + calculateCost(residualInput, residualOutput, modelId);
+    const residualCache = Math.max(0, data.cache_read || 0);
+    return exactCost + calculateCost(residualInput, residualOutput, modelId, residualCache);
 }
 
 function formatCost(cost) {
@@ -1370,33 +1685,139 @@ function formatPricePerMillion(price) {    const value = Number(price);
     return `$${value.toFixed(4).replace(/\.?0+$/, '')}/1M`;
 }
 
-function renderInputOutputRows(prefix, input, output, requests, valueFontSize = '14px') {
+function renderInputOutputRows(prefix, data, isCacheActive) {
+    data = data || {};
+    const input = data.input || 0;
+    const cache = data.cache_read || 0;
+    const output = data.output || 0;
+    const requests = data.messageCount || 0;
+
+    const displayIn = isCacheActive ? input : (input + cache);
+
+    if (isCacheActive) {
+        return `
+            <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; background: rgba(0, 0, 0, 0.22); border-radius: 5px; padding: 5px 4px; text-align: center; border: 1px solid rgba(255, 255, 255, 0.04);">
+                <div style="min-width: 0;">
+                    <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.6; line-height: 1.2; margin-bottom: 2px;" title="非缓存输入 Token (Net Input)">In</div>
+                    <div id="token-usage-${prefix}-in" style="font-size: 11px; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3;" title="${formatNumberFull(displayIn)}">${formatNumberAdaptive(displayIn)}</div>
+                </div>
+                <div style="min-width: 0;">
+                    <div style="font-size: 9px; color: #60a5fa; opacity: 0.95; line-height: 1.2; margin-bottom: 2px;" title="命中的提示词缓存 Token (Prompt Cache)">Cache</div>
+                    <div id="token-usage-${prefix}-cache" style="font-size: 11px; font-weight: 600; color: #60a5fa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3;" title="${formatNumberFull(cache)}">${formatNumberAdaptive(cache)}</div>
+                </div>
+                <div style="min-width: 0;">
+                    <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.6; line-height: 1.2; margin-bottom: 2px;" title="模型生成输出 Token (Output)">Out</div>
+                    <div id="token-usage-${prefix}-out" style="font-size: 11px; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3;" title="${formatNumberFull(output)}">${formatNumberAdaptive(output)}</div>
+                </div>
+                <div style="min-width: 0;">
+                    <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.6; line-height: 1.2; margin-bottom: 2px;" title="请求次数 (Requests)">Reqs</div>
+                    <div id="token-usage-${prefix}-requests" style="font-size: 11px; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3;" title="${formatNumberFull(requests)}">${formatNumberAdaptive(requests)}</div>
+                </div>
+            </div>
+        `;
+    } else {
+        return `
+            <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; background: rgba(0, 0, 0, 0.22); border-radius: 5px; padding: 5px 8px; text-align: center; border: 1px solid rgba(255, 255, 255, 0.04);">
+                <div style="min-width: 0;">
+                    <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.6; line-height: 1.2; margin-bottom: 2px;" title="总输入 Token (Total Input)">Input</div>
+                    <div id="token-usage-${prefix}-in" style="font-size: 11px; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3;" title="${formatNumberFull(displayIn)}">${formatNumberAdaptive(displayIn)}</div>
+                </div>
+                <div style="min-width: 0;">
+                    <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.6; line-height: 1.2; margin-bottom: 2px;" title="模型生成输出 Token (Output)">Output</div>
+                    <div id="token-usage-${prefix}-out" style="font-size: 11px; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3;" title="${formatNumberFull(output)}">${formatNumberAdaptive(output)}</div>
+                </div>
+                <div style="min-width: 0;">
+                    <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.6; line-height: 1.2; margin-bottom: 2px;" title="请求次数 (Requests)">Requests</div>
+                    <div id="token-usage-${prefix}-requests" style="font-size: 11px; font-weight: 600; color: var(--SmartThemeBodyColor); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3;" title="${formatNumberFull(requests)}">${formatNumberAdaptive(requests)}</div>
+                </div>
+            </div>
+        `;
+    }
+}
+
+function renderUsageStatCard(title, prefix, data, cost = '$0.00', isCacheActive = true) {
+    data = data || {};
+    const input = data.input || 0;
+    const cache = data.cache_read || 0;
+    const output = data.output || 0;
+    const requests = data.messageCount || 0;
+    const totalTokens = data.total != null ? data.total : (input + cache + output);
+    const totalPrompt = input + cache;
+
+    const hitRate = isCacheActive && totalPrompt > 0 && cache > 0
+        ? Math.round((cache / totalPrompt) * 100)
+        : null;
+
+    const hitRateBadge = (isCacheActive && hitRate !== null)
+        ? `<span style="font-size: 9px; padding: 1px 5px; border-radius: 4px; background: rgba(59, 130, 246, 0.2); color: #60a5fa; font-weight: 600; cursor: help; border: 1px solid rgba(96, 165, 250, 0.35);" title="提示词缓存命中率: ${hitRate}% (命中: ${formatNumberFull(cache)} / 总输入: ${formatNumberFull(totalPrompt)})">${hitRate}% hit</span>`
+        : '';
+
     return `
-        <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px 10px; color: var(--SmartThemeBodyColor);">
-            <div style="font-size: 10px; opacity: 0.75;">In</div>
-            <div style="font-size: 10px; opacity: 0.75;">Out</div>
-            <div style="font-size: 10px; opacity: 0.75;">Requests</div>
-            <div id="token-usage-${prefix}-in" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor);">${formatNumberFull(input || 0)}</div>
-            <div id="token-usage-${prefix}-out" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor);">${formatNumberFull(output || 0)}</div>
-            <div id="token-usage-${prefix}-requests" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor);">${formatNumberFull(requests || 0)}</div>
+        <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); padding: 7px 10px; box-sizing: border-box;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+                <div style="display: flex; align-items: center; gap: 6px; min-width: 0;">
+                    <span style="font-size: 11px; font-weight: 600; color: var(--SmartThemeBodyColor); letter-spacing: 0.2px;">${title}</span>
+                    ${hitRateBadge}
+                </div>
+                <div style="display: flex; align-items: baseline; gap: 5px; flex-shrink: 0;">
+                    <span style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.55;" title="Total: ${formatNumberFull(totalTokens)} tokens">${formatNumberAdaptive(totalTokens)} tok ·</span>
+                    <span style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Cost</span>
+                    <span id="token-usage-${prefix}-cost" style="font-size: 13px; font-weight: 700; color: var(--SmartThemeBodyColor);" title="${cost}">${cost}</span>
+                </div>
+            </div>
+            ${renderInputOutputRows(prefix, data, isCacheActive)}
         </div>
     `;
 }
 
-function renderUsageStatCard(title, prefix, data, cost = '$0.00') {
-    return `
-        <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); overflow: hidden; display: flex;">
-            <div style="flex: 1; padding: 6px 8px;">
-                <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5; margin-bottom: 4px;">${title}</div>
-                ${renderInputOutputRows(prefix, data.input, data.output, data.messageCount)}
-            </div>
-            <div style="width: 1px; background: var(--SmartThemeBorderColor);"></div>
-            <div style="flex: 0 0 78px; padding: 6px 8px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;">
-                <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Cost</div>
-                <span style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-${prefix}-cost">${cost}</span>
-            </div>
-        </div>
+function renderAllStatCards() {
+    const container = $('#token-usage-stats-grid');
+    if (container.length === 0) return;
+
+    const stats = getUsageStats();
+    const settings = getSettings();
+    const isCacheActive = settings.trackCache !== false;
+
+    // Calculate costs
+    const allTimeCost = calculateAllTimeCost();
+    const now = new Date();
+    const currentWeekKey = getWeekKey(now);
+    const currentMonthKey = getMonthKey(now);
+    const todayKey = getDayKey(now);
+
+    let weekCost = 0;
+    let monthCost = 0;
+    let todayCost = 0;
+
+    for (const [dayKey, data] of Object.entries(usageRuntime.byDay)) {
+        const [year, month, day] = dayKey.split('-').map(Number);
+        const date = new Date(year, month - 1, day);
+
+        if (getWeekKey(date) === currentWeekKey && data.models) {
+            for (const [mid, modelData] of Object.entries(data.models)) {
+                const cost = calculateStoredOrEstimatedCost(modelData, mid);
+                weekCost += cost || 0;
+                if (dayKey === todayKey) {
+                    todayCost += cost || 0;
+                }
+            }
+        }
+        if (getMonthKey(date) === currentMonthKey && data.models) {
+            for (const [mid, modelData] of Object.entries(data.models)) {
+                const cost = calculateStoredOrEstimatedCost(modelData, mid);
+                monthCost += cost || 0;
+            }
+        }
+    }
+
+    const cardsHtml = `
+        ${renderUsageStatCard('Today', 'today', stats.today, formatCost(todayCost), isCacheActive)}
+        ${renderUsageStatCard('This Week', 'week', stats.thisWeek, formatCost(weekCost), isCacheActive)}
+        ${renderUsageStatCard('This Month', 'month', stats.thisMonth, formatCost(monthCost), isCacheActive)}
+        ${renderUsageStatCard('All Time', 'alltime', stats.allTime, formatCost(allTimeCost), isCacheActive)}
     `;
+
+    container.html(cardsHtml);
 }
 
 /**
@@ -1415,8 +1836,15 @@ function calculateAllTimeCost() {
 
 // Chart state
 let currentChartRange = 30;
+let currentChartView = 'type'; // 'type' | 'model'
 let chartData = [];
 let tooltip = null;
+
+const TOKEN_TYPE_COLORS = {
+    in: '#6366f1',     // Indigo for Net Input
+    cache: '#38bdf8',  // Sky blue / cyan for Prompt Cache
+    out: '#10b981',    // Emerald for Output
+};
 
 // Chart colors - adapted for dark theme
 const CHART_COLORS = {
@@ -1456,6 +1884,7 @@ function getChartData(days) {
             dayKey: dayKey,
             usage: dayData.total || 0,
             input: dayData.input || 0,
+            cache_read: dayData.cache_read || 0,
             output: dayData.output || 0,
             messageCount: dayData.messageCount || 0,
             models: dayData.models || {},
@@ -1600,42 +2029,65 @@ function renderChart() {
             outerPathD = `M ${barX},${barY + h} v-${h - r} a${r},${r} 0 0 1 ${r},-${r} h${w - 2 * r} a${r},${r} 0 0 1 ${r},${r} v${h - r} z`;
         }
 
-        // Draw filled segments for each model
-        if (d.models && Object.keys(d.models).length > 0 && d.usage > 0) {
-            // Extract total from new object format or use number directly for legacy
-            const getTokens = (v) => typeof v === 'number' ? v : (v.total || 0);
-            const modelEntries = Object.entries(d.models).sort((a, b) => getTokens(b[1]) - getTokens(a[1])); // Sort by usage desc
+        // Draw filled segments
+        if (d.usage > 0) {
+            const segments = [];
+
+            if (currentChartView === 'type') {
+                const settings = getSettings();
+                const isCacheActive = settings.trackCache !== false;
+                const inTokens = isCacheActive ? (d.input || 0) : ((d.input || 0) + (d.cache_read || 0));
+                const cacheTokens = isCacheActive ? (d.cache_read || 0) : 0;
+                const outTokens = d.output || 0;
+
+                // Segments from bottom to top: In, Cache, Out
+                if (inTokens > 0) segments.push({ tokens: inTokens, color: TOKEN_TYPE_COLORS.in, label: 'In' });
+                if (cacheTokens > 0) segments.push({ tokens: cacheTokens, color: TOKEN_TYPE_COLORS.cache, label: 'Cache' });
+                if (outTokens > 0) segments.push({ tokens: outTokens, color: TOKEN_TYPE_COLORS.out, label: 'Out' });
+            } else {
+                // By Model
+                if (d.models && Object.keys(d.models).length > 0) {
+                    const getTokens = (v) => typeof v === 'number' ? v : (v.total || 0);
+                    const modelEntries = Object.entries(d.models).sort((a, b) => getTokens(b[1]) - getTokens(a[1]));
+                    let attributedTotal = 0;
+                    for (const [modelId, modelData] of modelEntries) {
+                        const tokens = getTokens(modelData);
+                        if (tokens > 0) {
+                            segments.push({ tokens, color: getModelColor(modelId), label: modelId });
+                            attributedTotal += tokens;
+                        }
+                    }
+                    if (d.usage > attributedTotal) {
+                        segments.push({ tokens: d.usage - attributedTotal, color: 'rgba(255, 255, 255, 0.25)', label: 'Unattributed' });
+                    }
+                } else {
+                    segments.push({ tokens: d.usage, color: 'rgba(255, 255, 255, 0.25)', label: 'Unattributed' });
+                }
+            }
 
             let cumulativeY = barY + h; // Start from bottom
-
-            for (const [modelId, modelData] of modelEntries) {
-                const tokens = getTokens(modelData);
-                const segmentHeight = (tokens / d.usage) * h;
+            for (let sIdx = 0; sIdx < segments.length; sIdx++) {
+                const seg = segments[sIdx];
+                const segmentHeight = (seg.tokens / d.usage) * h;
                 const segmentY = cumulativeY - segmentHeight;
 
-                // Create path for this segment with rounded corners for top segment
-                let segmentPath;
-                const isBottom = cumulativeY === barY + h;
-                const isTop = segmentY <= barY + 0.01; // Small epsilon for float comparison
+                const isBottom = sIdx === 0;
+                const isTop = sIdx === segments.length - 1;
 
+                let segmentPath;
                 if (segmentHeight < r * 2) {
-                    // Too small for rounded corners
                     segmentPath = `M ${barX},${cumulativeY} v-${segmentHeight} h${w} v${segmentHeight} z`;
                 } else if (isTop && isBottom) {
-                    // Only segment - round top corners
                     segmentPath = `M ${barX},${cumulativeY} v-${segmentHeight - r} a${r},${r} 0 0 1 ${r},-${r} h${w - 2 * r} a${r},${r} 0 0 1 ${r},${r} v${segmentHeight - r} z`;
                 } else if (isTop) {
-                    // Top segment - round top corners only
                     segmentPath = `M ${barX},${cumulativeY} v-${segmentHeight - r} a${r},${r} 0 0 1 ${r},-${r} h${w - 2 * r} a${r},${r} 0 0 1 ${r},${r} v${segmentHeight - r} z`;
                 } else {
-                    // Bottom or middle segment - no rounding
                     segmentPath = `M ${barX},${cumulativeY} v-${segmentHeight} h${w} v${segmentHeight} z`;
                 }
 
-                const color = getModelColor(modelId);
                 const segment = createSVGElement('path', {
                     d: segmentPath,
-                    fill: color,
+                    fill: seg.color,
                     opacity: '1',
                     'shape-rendering': 'geometricPrecision',
                     'pointer-events': 'none',
@@ -1675,10 +2127,95 @@ function renderChart() {
     });
 
     container.appendChild(svg);
+    renderChartLegend();
+}
+
+/**
+ * Render data legend below the chart
+ */
+function renderChartLegend() {
+    const legendEl = document.getElementById('token-usage-chart-legend');
+    if (!legendEl) return;
+
+    const settings = getSettings();
+    const isCacheActive = settings.trackCache !== false;
+    const totalTokens = chartData.reduce((acc, d) => acc + (d.usage || 0), 0);
+
+    let html = '';
+
+    if (currentChartView === 'type') {
+        const totalIn = chartData.reduce((acc, d) => acc + (isCacheActive ? (d.input || 0) : ((d.input || 0) + (d.cache_read || 0))), 0);
+        const totalCache = isCacheActive ? chartData.reduce((acc, d) => acc + (d.cache_read || 0), 0) : 0;
+        const totalOut = chartData.reduce((acc, d) => acc + (d.output || 0), 0);
+
+        const inPct = totalTokens > 0 ? Math.round((totalIn / totalTokens) * 100) : 0;
+        const cachePct = totalTokens > 0 ? Math.round((totalCache / totalTokens) * 100) : 0;
+        const outPct = totalTokens > 0 ? Math.round((totalOut / totalTokens) * 100) : 0;
+
+        html += `
+            <div style="display: flex; align-items: center; gap: 5px; font-size: 10px;" title="非缓存输入: ${formatNumberFull(totalIn)} tokens">
+                <span style="display: inline-block; width: 8px; height: 8px; border-radius: 2px; background: ${TOKEN_TYPE_COLORS.in}; flex-shrink: 0;"></span>
+                <span style="opacity: 0.75;">In (输入)</span>
+                <span style="font-weight: 600;">${formatNumberAdaptive(totalIn)}</span>
+                <span style="opacity: 0.45;">(${inPct}%)</span>
+            </div>
+        `;
+        if (isCacheActive) {
+            html += `
+                <div style="display: flex; align-items: center; gap: 5px; font-size: 10px;" title="缓存命中: ${formatNumberFull(totalCache)} tokens">
+                    <span style="display: inline-block; width: 8px; height: 8px; border-radius: 2px; background: ${TOKEN_TYPE_COLORS.cache}; flex-shrink: 0;"></span>
+                    <span style="color: #60a5fa; font-weight: 600;">Cache (缓存)</span>
+                    <span style="color: #60a5fa; font-weight: 700;">${formatNumberAdaptive(totalCache)}</span>
+                    <span style="color: #60a5fa; opacity: 0.8;">(${cachePct}%)</span>
+                </div>
+            `;
+        }
+        html += `
+            <div style="display: flex; align-items: center; gap: 5px; font-size: 10px;" title="生成输出: ${formatNumberFull(totalOut)} tokens">
+                <span style="display: inline-block; width: 8px; height: 8px; border-radius: 2px; background: ${TOKEN_TYPE_COLORS.out}; flex-shrink: 0;"></span>
+                <span style="opacity: 0.75;">Out (输出)</span>
+                <span style="font-weight: 600;">${formatNumberAdaptive(totalOut)}</span>
+                <span style="opacity: 0.45;">(${outPct}%)</span>
+            </div>
+        `;
+    } else {
+        // Model mode
+        const modelTotals = {};
+        for (const d of chartData) {
+            if (d.models) {
+                for (const [mId, mData] of Object.entries(d.models)) {
+                    const t = typeof mData === 'number' ? mData : (mData?.total || 0);
+                    modelTotals[mId] = (modelTotals[mId] || 0) + t;
+                }
+            }
+        }
+        const sortedModels = Object.entries(modelTotals).sort((a, b) => b[1] - a[1]);
+        if (sortedModels.length === 0) {
+            html = '<span style="opacity: 0.5; font-size: 10px;">暂无模型数据</span>';
+        } else {
+            for (const [mId, tokens] of sortedModels) {
+                const color = getModelColor(mId);
+                const pct = totalTokens > 0 ? Math.round((tokens / totalTokens) * 100) : 0;
+                const shortName = mId.length > 22 ? mId.substring(0, 19) + '...' : mId;
+                html += `
+                    <div style="display: flex; align-items: center; gap: 5px; font-size: 10px;" title="${mId}: ${formatNumberFull(tokens)} tokens">
+                        <span style="display: inline-block; width: 8px; height: 8px; border-radius: 2px; background: ${color}; flex-shrink: 0;"></span>
+                        <span style="max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: 0.85;">${shortName}</span>
+                        <span style="font-weight: 600;">${formatNumberAdaptive(tokens)}</span>
+                        <span style="opacity: 0.45;">(${pct}%)</span>
+                    </div>
+                `;
+            }
+        }
+    }
+
+    legendEl.innerHTML = html;
 }
 
 function showTooltip(d) {
     if (!tooltip) return;
+
+    const isCacheActive = getSettings().trackCache !== false;
 
     let tooltipCost = 0;
     if (d.models && Object.keys(d.models).length > 0) {
@@ -1692,14 +2229,15 @@ function showTooltip(d) {
     if (d.models && Object.keys(d.models).length > 0) {
         const getModelTokenBreakdown = (value) => {
             if (typeof value === 'number') {
-                return { total: value, input: null, output: null, messageCount: null };
+                return { total: value, input: null, cache_read: null, output: null, messageCount: null };
             }
 
             const input = Number(value?.input) || 0;
+            const cache_read = Number(value?.cache_read) || 0;
             const output = Number(value?.output) || 0;
-            const total = Number(value?.total) || (input + output);
+            const total = Number(value?.total) || (input + cache_read + output);
             const messageCount = Number(value?.messageCount);
-            return { total, input, output, messageCount: Number.isFinite(messageCount) ? messageCount : null };
+            return { total, input, cache_read, output, messageCount: Number.isFinite(messageCount) ? messageCount : null };
         };
 
         const modelEntries = Object.entries(d.models).sort((a, b) => getModelTokenBreakdown(a[1]).total - getModelTokenBreakdown(b[1]).total); // Sort ascending (smallest first, like graph bottom-up)
@@ -1710,21 +2248,22 @@ function showTooltip(d) {
             modelBreakdown += `<div style="font-size: 9px; color: rgba(255,255,255,0.3); margin-bottom: 2px;">+${hiddenEntryCount} more</div>`;
         }
         for (const [model, modelData] of displayEntries) {
-            const { total, input, output, messageCount } = getModelTokenBreakdown(modelData);
+            const { total, input, cache_read, output, messageCount } = getModelTokenBreakdown(modelData);
             const percent = d.usage > 0 ? Math.round((total / d.usage) * 100) : 0;
             const shortName = model.length > 25 ? model.substring(0, 22) + '...' : model;
             const color = getModelColor(model);
-            const breakdownLines = input !== null && output !== null
-                ? `
-                    <div style="margin-top: 0; margin-left: 12px; color: rgba(255,255,255,0.65); line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
-                        ${formatNumberFull(input)} | ${formatNumberFull(output)}${messageCount !== null ? ` | ${formatNumberFull(messageCount)}` : ''}
-                    </div>
-                `
-                : `
-                    <div style="margin-top: 0; margin-left: 12px; color: rgba(255,255,255,0.65); line-height: 1.15;">
-                        <div>Total: ${formatNumberFull(total)}</div>
-                    </div>
-                `;
+
+            let breakdownText = '';
+            if (input !== null && output !== null) {
+                if (isCacheActive) {
+                    const hit = (input + cache_read) > 0 && cache_read > 0 ? ` (${Math.round(cache_read / (input + cache_read) * 100)}% hit)` : '';
+                    breakdownText = `${formatNumberFull(input)} in${cache_read ? ` | ${formatNumberFull(cache_read)} cache${hit}` : ''} | ${formatNumberFull(output)} out${messageCount !== null ? ` | ${formatNumberFull(messageCount)} reqs` : ''}`;
+                } else {
+                    breakdownText = `${formatNumberFull(input + cache_read)} in | ${formatNumberFull(output)} out${messageCount !== null ? ` | ${formatNumberFull(messageCount)} reqs` : ''}`;
+                }
+            } else {
+                breakdownText = `Total: ${formatNumberFull(total)}`;
+            }
 
             modelBreakdown += `<div style="font-size: 9px; color: rgba(255,255,255,0.5); margin-bottom: 2px;">
                 <div style="display: flex; align-items: center; justify-content: space-between; gap: 6px;">
@@ -1734,23 +2273,42 @@ function showTooltip(d) {
                     </div>
                     <span style="flex-shrink: 0;">${percent}%</span>
                 </div>
-                ${breakdownLines}
+                <div style="margin-top: 0; margin-left: 12px; color: rgba(255,255,255,0.65); line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                    ${breakdownText}
+                </div>
             </div>`;
         }
         modelBreakdown += '</div>';
     }
 
+    const gridHtml = isCacheActive
+        ? `
+            <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px 6px; font-size: 10px; color: var(--SmartThemeBodyColor); margin-bottom: 2px;">
+                <div style="opacity: 0.6;">In</div>
+                <div style="opacity: 0.6; color: #60a5fa;" title="Prompt Cache Tokens">Cache</div>
+                <div style="opacity: 0.6;">Out</div>
+                <div style="opacity: 0.6;">Requests</div>
+                <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.input)}</div>
+                <div style="font-size: 11px; font-weight: 600; color: #60a5fa;">${formatNumberFull(d.cache_read || 0)}</div>
+                <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.output)}</div>
+                <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.messageCount)}</div>
+            </div>
+        `
+        : `
+            <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px 8px; font-size: 10px; color: var(--SmartThemeBodyColor); margin-bottom: 2px;">
+                <div style="opacity: 0.6;">In</div>
+                <div style="opacity: 0.6;">Out</div>
+                <div style="opacity: 0.6;">Requests</div>
+                <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.input + (d.cache_read || 0))}</div>
+                <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.output)}</div>
+                <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.messageCount)}</div>
+            </div>
+        `;
+
     tooltip.innerHTML = `
         <div style="font-weight: 600; margin-bottom: 2px; color: var(--SmartThemeBodyColor);">${d.fullDate}</div>
         <div style="font-size: 12px; font-weight: 600; color: var(--SmartThemeBodyColor); margin-bottom: 4px;">${formatCost(tooltipCost)}</div>
-        <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px 10px; font-size: 10px; color: var(--SmartThemeBodyColor); margin-bottom: 2px;">
-            <div style="opacity: 0.6;">In</div>
-            <div style="opacity: 0.6;">Out</div>
-            <div style="opacity: 0.6;">Requests</div>
-            <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.input)}</div>
-            <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.output)}</div>
-            <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.messageCount)}</div>
-        </div>
+        ${gridHtml}
         ${modelBreakdown}
     `;
     tooltip.style.display = 'block';
@@ -1806,77 +2364,26 @@ function updateChartRange(range) {
     });
 }
 
+function updateChartView(view) {
+    currentChartView = view;
+    document.querySelectorAll('.token-usage-view-btn').forEach(btn => {
+        const val = btn.getAttribute('data-view');
+        if (val === view) {
+            btn.classList.add('active');
+        } else {
+            btn.classList.remove('active');
+        }
+    });
+    renderChart();
+}
+
 /**
  * Update the stats display in the UI
  */
 function updateUIStats() {
+    renderAllStatCards();
+
     const stats = getUsageStats();
-    const now = new Date();
-
-    // Today stats
-    $('#token-usage-today-in').text(formatNumberFull(stats.today.input || 0));
-    $('#token-usage-today-out').text(formatNumberFull(stats.today.output || 0));
-    $('#token-usage-today-requests').text(formatNumberFull(stats.today.messageCount || 0));
-
-    // Stats grid
-    $('#token-usage-week-in').text(formatNumberFull(stats.thisWeek.input || 0));
-    $('#token-usage-week-out').text(formatNumberFull(stats.thisWeek.output || 0));
-    $('#token-usage-week-requests').text(formatNumberFull(stats.thisWeek.messageCount || 0));
-    $('#token-usage-month-in').text(formatNumberFull(stats.thisMonth.input || 0));
-    $('#token-usage-month-out').text(formatNumberFull(stats.thisMonth.output || 0));
-    $('#token-usage-month-requests').text(formatNumberFull(stats.thisMonth.messageCount || 0));
-    $('#token-usage-alltime-in').text(formatNumberFull(stats.allTime.input || 0));
-    $('#token-usage-alltime-out').text(formatNumberFull(stats.allTime.output || 0));
-    $('#token-usage-alltime-requests').text(formatNumberFull(stats.allTime.messageCount || 0));
-
-    // Cost calculations
-    const allTimeCost = calculateAllTimeCost();
-    $('#token-usage-alltime-cost').text(formatCost(allTimeCost));
-
-    // For Week/Month: We iterate all `byDay` keys and match those that belong to current week/month
-    const currentWeekKey = getWeekKey(now);
-    const currentMonthKey = getMonthKey(now);
-    const todayKey = getDayKey(now);
-
-    let weekCost = 0;
-    let monthCost = 0;
-    let todayCost = 0;
-
-    for (const [dayKey, data] of Object.entries(usageRuntime.byDay)) {
-        // Parse dayKey (YYYY-MM-DD) as local date, not UTC
-        // new Date("2026-01-01") interprets as UTC, which shifts timezone
-        const [year, month, day] = dayKey.split('-').map(Number);
-        const date = new Date(year, month - 1, day);
-
-        // Week check
-        if (getWeekKey(date) === currentWeekKey) {
-            // Calculate cost for this day using per-model input/output breakdown
-            if (data.models) {
-                for (const [mid, modelData] of Object.entries(data.models)) {
-                    // modelData is now { input, output, total } (or number for legacy data)
-                    const cost = calculateStoredOrEstimatedCost(modelData, mid);
-                    weekCost += cost || 0;
-                    if (dayKey === todayKey) {
-                        todayCost += cost || 0;
-                    }
-                }
-            }
-        }
-        // Month check
-        if (getMonthKey(date) === currentMonthKey) {
-            if (data.models) {
-                for (const [mid, modelData] of Object.entries(data.models)) {
-                    const cost = calculateStoredOrEstimatedCost(modelData, mid);
-                    monthCost += cost || 0;
-                }
-            }
-        }
-    }
-
-    $('#token-usage-week-cost').text(formatCost(weekCost));
-    $('#token-usage-month-cost').text(formatCost(monthCost));
-    $('#token-usage-today-cost').text(formatCost(todayCost));
-
     $('#token-usage-tokenizer').text('Tokenizer: ' + (stats.tokenizer || 'Unknown'));
 
     // Update chart data
@@ -1887,7 +2394,6 @@ function updateUIStats() {
     renderModelColorsGrid();
 }
 
-
 /**
  * Render the model colors grid with price inputs
  */
@@ -1897,20 +2403,23 @@ function renderModelColorsGrid() {
 
     const stats = getUsageStats();
     const models = Object.keys(stats.byModel || {}).sort();
+    const settings = getSettings();
+    const isCacheActive = settings.trackCache !== false;
 
     if (models.length === 0) {
         grid.empty().append('<div style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.5; padding: 8px; text-align: center;">No models tracked yet</div>');
         return;
     }
 
-    // If grid is already populated with the same models, don't wipe it (prevents input focus loss)
+    const currentMode = grid.attr('data-cache-mode');
+    const expectedMode = isCacheActive ? 'cache' : 'nocache';
     const existingRows = grid.children('.model-config-row');
-    if (existingRows.length === models.length) {
-        // Assume same order check isn't needed for now, unlikely to change order rapidly
+    if (existingRows.length === models.length && currentMode === expectedMode) {
         return;
     }
 
     grid.empty();
+    grid.attr('data-cache-mode', expectedMode);
 
     const formatPriceForInput = (value) => {
         if (value === null || value === undefined || Number.isNaN(value)) return '';
@@ -1926,17 +2435,23 @@ function renderModelColorsGrid() {
         const color = getModelColor(model);
         const prices = getModelPrice(model);
         const inputValue = formatPriceForInput(prices.in);
+        const cacheValue = formatPriceForInput(prices.cache);
         const outputValue = formatPriceForInput(prices.out);
 
+        const cacheInputHtml = isCacheActive ? `
+            <input type="number" class="price-input-cache" data-model="${model}" value="${cacheValue}" step="0.001" min="0" placeholder="Cache" title="Price per 1M cached tokens (default: 10% of In)" style="width: 36px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid rgba(96, 165, 250, 0.4); background: var(--SmartThemeInputColor); color: #60a5fa; flex-shrink: 0; text-align: center;">
+        ` : '';
+
         const row = $(`
-            <div class="model-config-row" style="display: flex; align-items: center; gap: 4px; min-width: 0;">
+            <div class="model-config-row" style="display: flex; align-items: center; gap: 4px; min-width: 0; padding: 2px 0;">
                 <input type="color" value="${color}" data-model="${model}"
                        class="model-color-picker"
-                       style="width: 20px; height: 20px; padding: 0; border: none; cursor: pointer; flex-shrink: 0; border-radius: 4px;">
+                       style="width: 18px; height: 18px; padding: 0; border: none; cursor: pointer; flex-shrink: 0; border-radius: 3px;">
                 <span title="${model}" style="font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--SmartThemeBodyColor); flex: 1;">${model}</span>
                 <span style="font-size: 8px; color: var(--SmartThemeBodyColor); opacity: 0.5; flex-shrink: 0;">Price</span>
-                <input type="number" class="price-input-in" data-model="${model}" value="${inputValue}" step="0.001" min="0" placeholder="In" title="Price per 1M input tokens" style="width: 32px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0;">
-                <input type="number" class="price-input-out" data-model="${model}" value="${outputValue}" step="0.001" min="0" placeholder="Out" title="Price per 1M output tokens" style="width: 32px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0;">
+                <input type="number" class="price-input-in" data-model="${model}" value="${inputValue}" step="0.001" min="0" placeholder="In" title="Price per 1M input tokens" style="width: 36px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0; text-align: center;">
+                ${cacheInputHtml}
+                <input type="number" class="price-input-out" data-model="${model}" value="${outputValue}" step="0.001" min="0" placeholder="Out" title="Price per 1M output tokens" style="width: 36px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0; text-align: center;">
             </div>
         `);
 
@@ -1951,8 +2466,9 @@ function renderModelColorsGrid() {
         const handlePriceChange = () => {
             const mId = model; // closure
             const pIn = row.find('.price-input-in').val();
+            const pCache = isCacheActive ? row.find('.price-input-cache').val() : null;
             const pOut = row.find('.price-input-out').val();
-            setModelPrice(mId, pIn, pOut);
+            setModelPrice(mId, pIn, pOut, pCache);
             // Trigger UI update to recalc costs
             updateUIStats();
         };
@@ -1971,6 +2487,8 @@ function renderModelColorsGrid() {
  */
 function createSettingsUI() {
     const stats = getUsageStats();
+    const settings = getSettings();
+    const isCacheActive = settings.trackCache !== false;
 
     const html = `
         <div id="token_usage_tracker_container" class="extension_container">
@@ -1982,21 +2500,28 @@ function createSettingsUI() {
                 <div class="inline-drawer-content">
                     <!-- Chart -->
                     <div class="token-usage-chart-shell" style="margin-bottom: 12px;">
-                        <div class="token-usage-range-controls" style="display: inline-flex; flex-wrap: wrap; justify-content: flex-end;">
-                            <button class="token-usage-range-btn menu_button" data-value="7" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">7D</button>
-                            <button class="token-usage-range-btn menu_button active" data-value="30" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">30D</button>
-                            <button class="token-usage-range-btn menu_button" data-value="90" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">90D</button>
-                            <button class="token-usage-range-btn menu_button" data-value="365" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">365D</button>
+                        <div class="token-usage-chart-toolbar" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; flex-wrap: wrap; gap: 4px;">
+                            <div class="token-usage-view-controls" style="display: inline-flex; gap: 2px;">
+                                <button class="token-usage-view-btn menu_button active" data-view="type" style="padding: 2px 8px; font-size: 10px; border-radius: 4px;" title="按输入/缓存/输出类型统计">按类型</button>
+                                <button class="token-usage-view-btn menu_button" data-view="model" style="padding: 2px 8px; font-size: 10px; border-radius: 4px;" title="按模型统计">按模型</button>
+                            </div>
+                            <div class="token-usage-range-controls" style="display: inline-flex; gap: 2px;">
+                                <button class="token-usage-range-btn menu_button" data-value="7" style="padding: 2px 8px; font-size: 10px; border-radius: 4px;">7D</button>
+                                <button class="token-usage-range-btn menu_button active" data-value="30" style="padding: 2px 8px; font-size: 10px; border-radius: 4px;">30D</button>
+                                <button class="token-usage-range-btn menu_button" data-value="90" style="padding: 2px 8px; font-size: 10px; border-radius: 4px;">90D</button>
+                                <button class="token-usage-range-btn menu_button" data-value="365" style="padding: 2px 8px; font-size: 10px; border-radius: 4px;">365D</button>
+                            </div>
                         </div>
-                        <div id="token-usage-chart" style="width: 100%; height: 320px; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 8px; overflow: hidden;"></div>
+                        <div id="token-usage-chart" style="width: 100%; height: 260px; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 8px; overflow: hidden;"></div>
+                        <div id="token-usage-chart-legend" style="display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 6px 12px; margin-top: 6px; padding: 6px 8px; font-size: 10px; color: var(--SmartThemeBodyColor); background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor);"></div>
                     </div>
 
                     <!-- Stats Grid (Today, Week, Month, All Time) -->
-                    <div class="token-usage-stats-grid" style="display: grid; gap: 6px; margin-bottom: 10px;">
-                        ${renderUsageStatCard('Today', 'today', stats.today)}
-                        ${renderUsageStatCard('This Week', 'week', stats.thisWeek)}
-                        ${renderUsageStatCard('This Month', 'month', stats.thisMonth)}
-                        ${renderUsageStatCard('All Time', 'alltime', stats.allTime)}
+                    <div id="token-usage-stats-grid" class="token-usage-stats-grid" style="display: grid; grid-template-columns: 1fr; gap: 6px; margin-bottom: 10px;">
+                        ${renderUsageStatCard('Today', 'today', stats.today, '$0.00', isCacheActive)}
+                        ${renderUsageStatCard('This Week', 'week', stats.thisWeek, '$0.00', isCacheActive)}
+                        ${renderUsageStatCard('This Month', 'month', stats.thisMonth, '$0.00', isCacheActive)}
+                        ${renderUsageStatCard('All Time', 'alltime', stats.allTime, '$0.00', isCacheActive)}
                     </div>
 
                     <!-- Config (Model Colors & Prices) -->
@@ -2006,12 +2531,48 @@ function createSettingsUI() {
                             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                         </div>
                         <div class="inline-drawer-content">
-                            <div id="token-usage-model-colors-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px;"></div>
+                            <div id="token-usage-model-colors-grid" style="display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; padding-right: 2px;"></div>
+                        </div>
+                    </div>
+
+                    <!-- Prompt Cache Settings -->
+                    <div class="inline-drawer" style="margin-top: 6px;">
+                        <div class="inline-drawer-toggle inline-drawer-header" style="padding: 4px 0 4px 8px;">
+                            <span style="font-size: 11px;">Prompt Cache (提示词缓存)</span>
+                            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                        </div>
+                        <div class="inline-drawer-content" style="padding: 6px 8px; font-size: 11px;">
+                            <label style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px; cursor: pointer; font-weight: 600;">
+                                <input type="checkbox" id="token-usage-track-cache">
+                                <span>按缓存统计 (Track Prompt Cache)</span>
+                            </label>
+                            <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.65; margin-bottom: 8px; line-height: 1.35;">
+                                开启后在卡片中独立显示 Cache 命中及费率；关闭后所有缓存 Token 合并为输入统计。
+                            </div>
+                            <div id="token-usage-cache-sub-options" style="border-top: 1px dashed var(--SmartThemeBorderColor); padding-top: 6px;">
+                                <label style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px; cursor: pointer;">
+                                    <input type="checkbox" id="token-usage-cache-sim-enabled">
+                                    <span>中转未返时推算缓存 (Infer Cache)</span>
+                                </label>
+                                <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.55; margin-bottom: 6px;">
+                                    当中转代理未返回 cached_tokens 时，自动根据前缀与时间差模拟推算。
+                                </div>
+                                <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                                    <label style="display: flex; align-items: center; gap: 4px;">
+                                        <span style="opacity: 0.7;">Min Tokens:</span>
+                                        <input type="number" id="token-usage-cache-min-tokens" min="0" step="64" style="width: 55px; padding: 2px 4px; font-size: 10px; border-radius: 3px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor);">
+                                    </label>
+                                    <label style="display: flex; align-items: center; gap: 4px;">
+                                        <span style="opacity: 0.7;">TTL (min):</span>
+                                        <input type="number" id="token-usage-cache-ttl-min" min="0" step="1" style="width: 45px; padding: 2px 4px; font-size: 10px; border-radius: 3px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor);">
+                                    </label>
+                                </div>
+                            </div>
                         </div>
                     </div>
 
                     <!-- Controls -->
-                    <div style="display: flex; align-items: center; gap: 8px; padding-left: 8px;">
+                    <div style="display: flex; align-items: center; gap: 8px; padding-left: 8px; margin-top: 8px;">
                         <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.4;" id="token-usage-tokenizer">Tokenizer: ${stats.tokenizer || 'Unknown'}</div>
                         <div style="flex: 1;"></div>
                         <div id="token-usage-export" class="menu_button" title="Download all usage data as CSV" style="color: var(--SmartThemeBodyColor); opacity: 0.8; font-size: 11px; white-space: nowrap;">
@@ -2038,6 +2599,46 @@ function createSettingsUI() {
         }
     }
 
+    // Initialize Prompt Cache settings inputs
+    if (!settings.cacheSimulation) settings.cacheSimulation = structuredClone(defaultSettings.cacheSimulation);
+    const isCacheTracked = settings.trackCache !== false;
+    $('#token-usage-track-cache').prop('checked', isCacheTracked);
+    if (!isCacheTracked) {
+        $('#token-usage-cache-sub-options').hide();
+    } else {
+        $('#token-usage-cache-sub-options').show();
+    }
+
+    $('#token-usage-track-cache').on('change', function () {
+        const checked = $(this).is(':checked');
+        settings.trackCache = checked;
+        saveSettings();
+        if (checked) {
+            $('#token-usage-cache-sub-options').slideDown(150);
+        } else {
+            $('#token-usage-cache-sub-options').slideUp(150);
+        }
+        $('#token-usage-model-colors-grid').removeAttr('data-cache-mode');
+        updateUIStats();
+    });
+
+    $('#token-usage-cache-sim-enabled').prop('checked', settings.cacheSimulation.enabled !== false);
+    $('#token-usage-cache-min-tokens').val(settings.cacheSimulation.minThreshold ?? 1024);
+    $('#token-usage-cache-ttl-min').val(settings.cacheSimulation.ttlMinutes ?? 10);
+
+    $('#token-usage-cache-sim-enabled').on('change', function () {
+        settings.cacheSimulation.enabled = $(this).is(':checked');
+        saveSettings();
+    });
+    $('#token-usage-cache-min-tokens').on('input', function () {
+        settings.cacheSimulation.minThreshold = Math.max(0, parseInt($(this).val(), 10) || 0);
+        saveSettings();
+    });
+    $('#token-usage-cache-ttl-min').on('input', function () {
+        settings.cacheSimulation.ttlMinutes = Math.max(0, parseInt($(this).val(), 10) || 0);
+        saveSettings();
+    });
+
     // Create tooltip element and append to body (not inside extension container to avoid layout issues)
     if (!document.getElementById('token-usage-tooltip')) {
         const tooltipEl = document.createElement('div');
@@ -2056,6 +2657,13 @@ function createSettingsUI() {
     document.querySelectorAll('.token-usage-range-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             updateChartRange(parseInt(btn.getAttribute('data-value')));
+        });
+    });
+
+    // View button handlers
+    document.querySelectorAll('.token-usage-view-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            updateChartView(btn.getAttribute('data-view'));
         });
     });
 
